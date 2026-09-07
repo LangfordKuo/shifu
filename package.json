@@ -1,0 +1,28 @@
+{
+  "name": "shifu",
+  "version": "0.1.0",
+  "private": true,
+  "description": "shifu - AI 武术动作指导平台 (monorepo)",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev:server": "npm run start:dev -w server",
+    "dev:web": "npm run dev -w web",
+    "dev:ai": "python -m uvicorn app.main:app --reload --port 8000 --app-dir ai",
+    "build": "npm run build -w server && npm run build -w web",
+    "db:migrate": "npm run db:migrate -w server",
+    "db:seed": "npm run db:seed -w server"
+  },
+  "allowScripts": {
+    "@prisma/engines@6.19.3": true,
+    "vue-demi@0.14.10": true,
+    "esbuild@0.28.2": true,
+    "prisma@6.19.3": true,
+    "@prisma/client@6.19.3": true
+  }
+}

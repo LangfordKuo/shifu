@@ -1,0 +1,101 @@
+// shifu 数据模型
+// 角色约定：ADMIN = 管理员，USER = 普通用户
+// 课程状态：DRAFT / TRAINING / PUBLISHED / OFFLINE
+// 任务状态：PENDING / RUNNING / SUCCESS / FAILED
+// 说明：SQLite 不支持 enum，统一用字符串常量；未来切 MySQL 时可无损改为 enum。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  username     String   @unique
+  passwordHash String
+  nickname     String?
+  role         String   @default("USER")
+  status       String   @default("ACTIVE") // ACTIVE / DISABLED
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  refreshTokens    RefreshToken[]
+  coursesCreated   Course[]
+  trainingSessions TrainingSession[]
+}
+
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  tokenHash String    @unique // sha256(refreshToken)
+  userId    Int
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Course {
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String?
+  category    String   @default("general")
+  coverUrl    String?
+  videoPath   String?
+  status      String   @default("DRAFT")
+  createdById Int
+  createdBy   User     @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  models           CourseModel[]
+  trainingSessions TrainingSession[]
+  jobs             TrainingJob[]
+}
+
+// 课程模型：由 AI 服务从示范视频提取生成的动作模板（模板法一期方案）
+model CourseModel {
+  id            Int      @id @default(autoincrement())
+  courseId      Int
+  course        Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  version       Int      @default(1)
+  modelPath     String // 模型 JSON 文件路径（data/models/…）
+  keyframeCount Int      @default(0)
+  durationMs    Int      @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+}
+
+// AI 训练任务（Node 下发，Python 执行，进度回写）
+model TrainingJob {
+  id        Int       @id @default(autoincrement())
+  courseId  Int
+  course    Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  type      String // EXTRACT / TRAIN
+  status    String    @default("PENDING")
+  progress  Int       @default(0) // 0-100
+  error     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+// 用户一次训练的会话记录与报告
+model TrainingSession {
+  id         Int      @id @default(autoincrement())
+  userId     Int
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseId   Int
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  score      Float?
+  durationMs Int      @default(0)
+  reportJson String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([courseId])
+}

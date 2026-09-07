@@ -1,0 +1,13 @@
+# shifu-ai 依赖
+# Web 框架
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic-settings>=2.0
+
+# WS 鉴权（解析 NestJS 签发的 JWT）
+PyJWT>=2.9
+
+# 姿态推理（首次安装体量较大）
+ultralytics>=8.3
+# torch 默认安装 CPU 版；有 NVIDIA 显卡时改装 GPU 版：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
