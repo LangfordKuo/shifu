@@ -120,6 +120,10 @@ async def train(ws: WebSocket) -> None:
                                 "durationMs": course_session.duration_ms,
                                 "waitMs": course_session.wait_ms,
                                 "holdTh": course_session.hold_th,
+                                # 各拍时间点（ms），供前端示范视频分段播放
+                                "keyframeTimes": [
+                                    kf["t_ms"] for kf in payload_cm["model"]["keyframes"]
+                                ],
                             }
                         )
                     except Exception as e:

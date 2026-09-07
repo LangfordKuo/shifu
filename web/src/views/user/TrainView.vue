@@ -79,6 +79,11 @@ const holdRemaining = ref<number | null>(null); // 达标后等待进入下一�
 const waitSec = ref(Math.min(30, Math.max(0, Number(localStorage.getItem('shifu.waitSec')) || 3)));
 const holdTh = ref(Math.min(95, Math.max(50, Number(localStorage.getItem('shifu.holdTh')) || 75)));
 
+// 教练示范视频分段同步：进入第 N 拍 → 播放上一拍标记到本拍标记的片段 → 定格在本拍标准动作
+const demoVideoRef = ref<HTMLVideoElement | null>(null);
+const keyframeTimes = ref<number[]>([]); // 各拍时间点（ms）
+let demoEndMs: number | null = null; // 当前片段结束点（null = 已定格）
+
 // 会话统计（课程模式结束时报给后端）
 let sessionStart = 0;
 let courseScoreSum = 0;
@@ -175,7 +180,11 @@ async function startTraining() {
 
     // 3. 课程模式：加载课程模型
     if (courseId && courseInfo.value) {
-      const loaded = await client.sendAndWait<{ phase_total: number; waitMs: number }>(
+      const loaded = await client.sendAndWait<{
+        phase_total: number;
+        waitMs: number;
+        keyframeTimes: number[];
+      }>(
         { type: 'start_course', courseId, waitMs: waitSec.value * 1000, holdTh: holdTh.value },
         'course_loaded',
         15000,
@@ -187,6 +196,9 @@ async function startTraining() {
       course.progress = 0;
       course.match = 0;
       holdRemaining.value = null;
+      keyframeTimes.value = loaded.keyframeTimes ?? [];
+      lastSyncedPhase = 0;
+      demoEndMs = null;
       resetVoiceState();
       speakNow('准备好，跟随口令开始练习', soundOn.value);
     }
@@ -292,6 +304,8 @@ async function stopTraining() {
   ghostPose.value = null;
   holdRemaining.value = null;
   resetVoiceState();
+  lastSyncedPhase = 0;
+  demoEndMs = null;
   fps.value = 0;
   latency.value = 0;
 }
@@ -414,6 +428,12 @@ function handleResult(res: TrainResult) {
     }
 
     humanizedSpeak(res);
+
+    // 示范视频分段同步：拍号变化时播放对应片段
+    if (res.phase && res.phase !== lastSyncedPhase) {
+      lastSyncedPhase = res.phase;
+      syncDemoVideo(res.phase);
+    }
   } else if (result.suggestions[0]) {
     speak(result.suggestions[0], soundOn.value);
   }
@@ -481,6 +501,43 @@ function skipPhase() {
   if (phase.value !== 'running') return;
   client?.sendControl({ type: 'skip_phase' });
   holdRemaining.value = null;
+}
+
+// ---------- 示范视频分段同步 ----------
+let lastSyncedPhase = 0;
+
+/** 进入第 p 拍：播放上一拍标记 → 本拍标记 的片段 */
+function syncDemoVideo(p: number) {
+  const v = demoVideoRef.value;
+  if (!v || !keyframeTimes.value.length || !showDemoVideo.value) return;
+  const endMs = keyframeTimes.value[p - 1] ?? v.duration * 1000;
+  const startMs = p >= 2 ? keyframeTimes.value[p - 2] ?? 0 : 0;
+  demoEndMs = endMs;
+  try {
+    v.currentTime = startMs / 1000;
+    void v.play().catch(() => {});
+  } catch {
+    // 视频未就绪，忽略
+  }
+}
+
+/** 片段播完：定格在本拍标准动作帧 */
+function onDemoTimeUpdate() {
+  const v = demoVideoRef.value;
+  if (!v || demoEndMs == null) return;
+  if (v.currentTime * 1000 >= demoEndMs) {
+    v.currentTime = demoEndMs / 1000;
+    v.pause();
+    demoEndMs = null;
+  }
+}
+
+/** 开关示范视频小窗：打开时同步到当前拍片段 */
+function toggleDemoVideo() {
+  showDemoVideo.value = !showDemoVideo.value;
+  if (showDemoVideo.value) {
+    setTimeout(() => syncDemoVideo(course.phase), 120);
+  }
 }
 
 // ---------- 演示图片 ----------
@@ -624,23 +681,39 @@ async function runDemo() {
               <canvas ref="canvasRef" class="absolute inset-0 h-full w-full"></canvas>
             </div>
 
-            <!-- 教练示范视频小窗（镜像容器外，避免左右翻转） -->
+            <!-- 达标大字倒计时（镜像容器外，避免翻转） -->
+            <div
+              v-if="holdRemaining != null && phase === 'running'"
+              class="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2"
+            >
+              <div class="text-sm font-medium tracking-widest text-white/90 drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)]">
+                动作达标 · 保持住
+              </div>
+              <div
+                class="text-[110px] font-black leading-none text-white drop-shadow-[0_4px_24px_rgba(0,0,0,0.85)] sm:text-[140px]"
+              >
+                {{ Math.ceil(holdRemaining / 1000) }}
+              </div>
+            </div>
+
+            <!-- 教练示范视频小窗（镜像容器外，避免左右翻转）：进入第 N 拍时播放上一拍→本拍片段，播完定格在本拍标准动作 -->
             <div
               v-if="showDemoVideo && courseInfo?.videoUrl && phase === 'running'"
               class="absolute right-2 top-2 z-10 w-24 overflow-hidden rounded-lg border border-white/40 shadow-lg sm:w-36"
             >
               <video
+                ref="demoVideoRef"
                 class="h-auto w-full"
                 :src="courseInfo.videoUrl"
                 autoplay
-                loop
                 muted
                 playsinline
+                @timeupdate="onDemoTimeUpdate"
               ></video>
               <div
                 class="absolute left-1 top-1 rounded bg-black/60 px-1 text-[10px] text-white"
               >
-                示范
+                示范 · 第 {{ course.phase || 1 }} 拍
               </div>
             </div>
 
@@ -688,7 +761,7 @@ async function runDemo() {
             size="sm"
             :variant="showDemoVideo ? 'secondary' : 'outline'"
             :title="showDemoVideo ? '关闭示范视频' : '开启示范视频'"
-            @click="showDemoVideo = !showDemoVideo"
+            @click="toggleDemoVideo"
           >
             示范视频 {{ showDemoVideo ? '开' : '关' }}
           </Button>
