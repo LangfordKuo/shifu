@@ -1,7 +1,8 @@
-"""课程模型提取管线（模板法）。
+"""课程模型提取（人工打标模式）。
 
-示范视频 → YOLO 逐帧关键点 → EMA 平滑 → 归一化 → 姿态变化速率切分关键帧
-→ 课程模型 JSON（每关键帧的角度模板 + 容差 + 口令）+ 封面图。
+管理员在前台视频预览中人工标记每一拍的时间戳（tMs + 口令），
+本模块按标记的时间点定点提取教练姿态：YOLO 关键点 → 平滑 →
+髋原点/躯干尺度归一化 → 关键帧（角度模板 + 容差 + 口令）→ 课程模型 JSON。
 """
 
 from __future__ import annotations
@@ -22,10 +23,9 @@ from app.engine.smoother import KeypointSmoother
 
 logger = logging.getLogger("shifu.ai.extract")
 
-SAMPLE_FPS = 15  # 采样帧率
-MIN_GAP_MS = 1500  # 关键帧最小间隔
-VEL_TH = 10.0  # 关键帧候选的姿态变化阈值（平均角度差，度）
-MAX_KEYFRAMES = 24
+# 每个打点前后各取多少毫秒的帧做采样，取检测质量最好的一帧
+SEEK_BACK_MS = 350
+SAMPLE_WINDOW_MS = 700
 DEFAULT_TOLERANCE = 15.0  # 纠偏容差（度）
 
 
@@ -51,136 +51,120 @@ def _normalize(landmarks: list[dict[str, float]]) -> list[list[float]]:
     ]
 
 
-def _angle_distance(a: dict[str, float], b: dict[str, float]) -> float:
-    """两个角度向量的平均绝对差（仅双方可见关节）；无可用关节返回 999。"""
-    diffs = [
-        abs(a[k] - b[k])
-        for k in a
-        if a[k] >= 0 and b.get(k, -1) >= 0
-    ]
-    return sum(diffs) / len(diffs) if diffs else 999.0
+def _detect_best_at(
+    cap: cv2.VideoCapture, t_ms: int, engine
+) -> tuple[list[dict[str, float]] | None, cv2.Mat | None]:
+    """在 t_ms 附近采样若干帧，返回可见关键点最多的检测结果。"""
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    start_ms = max(0, t_ms - SEEK_BACK_MS)
+    step_ms = max(1, 1000.0 / fps)
+    n = max(1, int(SAMPLE_WINDOW_MS / step_ms))
+    cap.set(cv2.CAP_PROP_POS_MSEC, start_ms)
+
+    best_lm: list[dict[str, float]] | None = None
+    best_frame: cv2.Mat | None = None
+    best_visible = -1
+    for i in range(n):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        lm = engine.detect(frame)
+        if lm:
+            visible = sum(1 for p in lm if p["v"] > 0.3)
+            if visible > best_visible:
+                best_visible = visible
+                best_lm = lm
+                best_frame = frame.copy()
+        if start_ms + i * step_ms > t_ms + SAMPLE_WINDOW_MS - SEEK_BACK_MS:
+            break
+    return best_lm, best_frame
 
 
-def extract(
+def extract_at_markers(
     video_path: str,
     uploads_root: str,
     job_id: int,
+    markers: list[dict[str, Any]],
     on_progress: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
-    """提取课程模型，返回 {"model": {...}, "cover_path": "..."}。"""
+    """按人工打点提取课程模型。
+
+    markers: [{"tMs": 1200, "cue": "起势"}, ...]（已按时间升序）
+    返回 {"model": {...}, "cover_url": "..."}。
+    """
     engine = get_pose_engine()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ExtractError("无法读取视频文件")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    step = max(1, round(fps / SAMPLE_FPS))
-    ms_per_sample = 1000.0 * step / fps
-
-    smoother = KeypointSmoother(alpha=0.4)
-    samples: list[dict[str, Any]] = []  # {t_ms, angles, pose}
-    idx = -1
+    smoother = KeypointSmoother(alpha=0.9)  # 打点间相互独立，仅做轻微平滑
+    keyframes: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    cover_frame = None
     last_cb = time.perf_counter()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        idx += 1
-        if idx % step != 0:
+    for n, marker in enumerate(markers, start=1):
+        t_ms = int(marker["tMs"])
+        lm, frame = _detect_best_at(cap, t_ms, engine)
+        if not lm:
+            skipped.append(f"第 {n} 拍（{t_ms}ms）")
             continue
+        smoothed = smoother.smooth(lm)
+        keyframes.append(
+            {
+                "index": len(keyframes) + 1,
+                "t_ms": t_ms,
+                "pose": _normalize(smoothed),
+                "angles": calculate_angles(smoothed),
+                "tolerance": {
+                    k: DEFAULT_TOLERANCE
+                    for k, v in calculate_angles(smoothed).items()
+                    if v >= 0
+                },
+                "cue": (marker.get("cue") or f"第 {len(keyframes) + 1} 拍").strip(),
+            }
+        )
+        if cover_frame is None:
+            cover_frame = frame
 
-        small = frame
-        h, w = small.shape[:2]
-        if max(h, w) > 960:
-            scale = 960 / max(h, w)
-            small = cv2.resize(small, (int(w * scale), int(h * scale)))
-        lm = engine.detect(small)
-        if lm:
-            smoothed = smoother.smooth(lm)
-            samples.append(
-                {
-                    "t_ms": round(idx * 1000.0 / fps),
-                    "angles": calculate_angles(smoothed),
-                    "pose": _normalize(smoothed),
-                    "frame": small.copy(),
-                }
-            )
-
-        if on_progress and total_frames:
-            done = (idx + 1) / total_frames * 80  # 推理占 0-80%
+        if on_progress:
+            done = n / len(markers) * 90
             now = time.perf_counter()
-            if now - last_cb > 1.5:
+            if now - last_cb > 1.0:
                 last_cb = now
                 on_progress(done)
     cap.release()
 
-    if len(samples) < 3:
-        raise ExtractError("未能从视频中检测到稳定的人体动作，请确认示范者全身入镜")
+    if not keyframes:
+        raise ExtractError("所有打点均未能检测到人体，请确认示范者全身入镜后重新生成")
+    if skipped:
+        logger.warning("跳过未检测到人体的打点: %s", "、".join(skipped))
 
-    # ---------- 关键帧切分：姿态变化速率局部峰值 ----------
-    vels = [0.0]
-    for i in range(1, len(samples)):
-        vels.append(_angle_distance(samples[i]["angles"], samples[i - 1]["angles"]))
-
-    order = sorted(range(len(samples)), key=lambda i: vels[i], reverse=True)
-    chosen: list[int] = []
-    for i in order:
-        if vels[i] < VEL_TH:
-            break
-        if all(abs(samples[i]["t_ms"] - samples[j]["t_ms"]) >= MIN_GAP_MS for j in chosen):
-            chosen.append(i)
-        if len(chosen) >= MAX_KEYFRAMES:
-            break
-    chosen.sort()
-    if not chosen:
-        chosen = [len(samples) // 2]  # 静态保持类动作取中段一帧
-    # 保证首尾覆盖
-    if chosen[0] != 0:
-        chosen.insert(0, 0)
-    if chosen[-1] != len(samples) - 1:
-        chosen.append(len(samples) - 1)
-
-    keyframes = []
-    for n, i in enumerate(chosen, start=1):
-        s = samples[i]
-        keyframes.append(
-            {
-                "index": n,
-                "t_ms": s["t_ms"],
-                "pose": s["pose"],
-                "angles": s["angles"],
-                "tolerance": {k: DEFAULT_TOLERANCE for k, v in s["angles"].items() if v >= 0},
-                "cue": f"第 {n} 拍",
-            }
-        )
-
-    duration_ms = samples[-1]["t_ms"]
     model = {
         "version": 1,
-        "sample_fps": round(fps / step, 2),
-        "duration_ms": duration_ms,
+        "duration_ms": keyframes[-1]["t_ms"],
         "keyframe_count": len(keyframes),
         "keyframes": keyframes,
     }
 
-    # ---------- 封面：第一个关键帧（含骨架更直观，这里存原始帧） ----------
     cover_rel = os.path.join("covers", f"job_{job_id}.jpg")
     cover_path = os.path.join(uploads_root, cover_rel)
     os.makedirs(os.path.dirname(cover_path), exist_ok=True)
-    cv2.imwrite(cover_path, samples[chosen[0]]["frame"], [cv2.IMWRITE_JPEG_QUALITY, 85])
+    cv2.imwrite(cover_path, cover_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
     on_progress and on_progress(95)
     return {
         "model": model,
         "cover_url": f"/api/uploads/{cover_rel.replace(os.sep, '/')}",
+        "skipped": skipped,
     }
 
 
 def save_model(model: dict[str, Any], course_id: int) -> str:
     """模型 JSON 落盘，返回绝对路径。"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "models")
+    data_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "models"
+    )
     os.makedirs(data_dir, exist_ok=True)
     path = os.path.join(data_dir, f"course_{course_id}_v{model['version']}.json")
     with open(path, "w", encoding="utf-8") as f:

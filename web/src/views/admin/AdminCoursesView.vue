@@ -5,10 +5,12 @@ import {
   Film,
   ListOrdered,
   Loader2,
+  MapPinPlus,
   Plus,
   Rocket,
   Trash2,
   Undo2,
+  Wand2,
 } from 'lucide-vue-next';
 import { toast } from 'vue-sonner';
 import { api } from '@/lib/api';
@@ -145,7 +147,7 @@ async function submit() {
     fd.append('category', form.category);
     fd.append('video', form.video);
     await uploadWithProgress('/api/admin/courses', fd, (p) => (uploadPercent.value = p));
-    toast.success('课程已创建，AI 正在提取动作模型');
+    toast.success('课程已创建，请在列表中点击「打标」标记每一拍');
     dialogOpen.value = false;
     load();
   } catch (err) {
@@ -190,6 +192,104 @@ async function confirmDelete() {
     toast.error(err instanceof Error ? err.message : '删除失败');
   }
 }
+
+// ---------- 人工打标 ----------
+interface MarkerRow {
+  tMs: number;
+  cue: string;
+}
+const markDialog = ref(false);
+const markCourse = ref<CourseRow | null>(null);
+const markers = ref<MarkerRow[]>([]);
+const markVideoRef = ref<HTMLVideoElement | null>(null);
+const currentTime = ref(0);
+const savingMarkers = ref(false);
+const generating = ref(false);
+
+async function openMarking(row: CourseRow) {
+  markCourse.value = row;
+  markers.value = [];
+  markDialog.value = true;
+  try {
+    const data = await api.get<{ markers: MarkerRow[] }>(
+      `/admin/courses/${row.id}/markers`,
+    );
+    markers.value = data.markers;
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '加载打标失败');
+  }
+}
+
+function addMarker() {
+  const t = Math.round((markVideoRef.value?.currentTime ?? 0) * 1000);
+  if (markers.value.some((m) => Math.abs(m.tMs - t) < 200)) {
+    toast.warning('距离上一个打点太近（<0.2 秒）');
+    return;
+  }
+  markers.value.push({ tMs: t, cue: '' });
+  markers.value.sort((a, b) => a.tMs - b.tMs);
+}
+
+function removeMarker(i: number) {
+  markers.value.splice(i, 1);
+}
+
+function fmtMs(ms: number) {
+  const s = ms / 1000;
+  const m = Math.floor(s / 60);
+  return `${m}:${(s % 60).toFixed(1).padStart(4, '0')}`;
+}
+
+async function saveMarkers(silent = false) {
+  if (!markCourse.value) return;
+  savingMarkers.value = true;
+  try {
+    await api.put(`/admin/courses/${markCourse.value.id}/markers`, {
+      markers: markers.value,
+    });
+    if (!silent) toast.success('打标已保存');
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '保存失败');
+    throw err;
+  } finally {
+    savingMarkers.value = false;
+  }
+}
+
+async function generateModel() {
+  if (markers.value.length === 0) {
+    toast.error('请至少打一个点');
+    return;
+  }
+  generating.value = true;
+  try {
+    await saveMarkers(true);
+    await api.post(`/admin/courses/${markCourse.value!.id}/generate-model`);
+    toast.success('已开始生成动作模型，可在列表查看进度');
+    markDialog.value = false;
+    load();
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '生成失败');
+  } finally {
+    generating.value = false;
+  }
+}
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (!markDialog.value) return;
+  const tag = (e.target as HTMLElement)?.tagName;
+  if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'BUTTON'].includes(tag)) {
+    e.preventDefault();
+    addMarker();
+  }
+}
+
+onMounted(() => window.addEventListener('keydown', onGlobalKeydown));
+
+async function beforeUnmountCleanup() {
+  window.removeEventListener('keydown', onGlobalKeydown);
+}
+onBeforeUnmount(() => void beforeUnmountCleanup());
 
 function fmtDuration(ms: number) {
   if (!ms) return '—';
@@ -247,14 +347,16 @@ function fmtTime(s: string) {
   return new Date(s).toLocaleString('zh-CN', { hour12: false });
 }
 
-const statusBadge = (s: string) =>
+const statusBadge = (s: string, keyframes = 1) =>
   s === 'PUBLISHED'
     ? { text: '已发布', cls: 'default' as const }
     : s === 'TRAINING'
-      ? { text: '提取中', cls: 'secondary' as const }
+      ? { text: '生成中', cls: 'secondary' as const }
       : s === 'OFFLINE'
         ? { text: '已下架', cls: 'destructive' as const }
-        : { text: '草稿', cls: 'outline' as const };
+        : keyframes
+          ? { text: '草稿', cls: 'outline' as const }
+          : { text: '待打标', cls: 'outline' as const };
 </script>
 
 <template>
@@ -300,7 +402,9 @@ const statusBadge = (s: string) =>
               </TableCell>
               <TableCell>{{ CATEGORY_LABELS[row.category] ?? row.category }}</TableCell>
               <TableCell>
-                <Badge :variant="statusBadge(row.status).cls">{{ statusBadge(row.status).text }}</Badge>
+                <Badge :variant="statusBadge(row.status, row.keyframeCount).cls">
+                  {{ statusBadge(row.status, row.keyframeCount).text }}
+                </Badge>
                 <div v-if="row.job?.status === 'FAILED'" class="mt-1 max-w-40 text-xs text-destructive">
                   {{ row.job.error }}
                 </div>
@@ -325,6 +429,15 @@ const statusBadge = (s: string) =>
               </TableCell>
               <TableCell class="text-muted-foreground">{{ fmtTime(row.createdAt) }}</TableCell>
               <TableCell class="space-x-1 text-right">
+                <Button
+                  v-if="row.videoPath"
+                  size="sm"
+                  variant="ghost"
+                  title="视频打标"
+                  @click="openMarking(row)"
+                >
+                  <MapPinPlus />
+                </Button>
                 <Button
                   v-if="row.keyframeCount"
                   size="sm"
@@ -368,7 +481,7 @@ const statusBadge = (s: string) =>
         <DialogHeader>
           <DialogTitle>新建课程</DialogTitle>
           <DialogDescription>
-            上传教练示范视频，AI 将提取关键帧生成动作模型（约每分钟视频耗时 1-2 分钟）
+            上传教练示范视频；保存后在课程列表点击「打标」人工标记每一拍，再生成动作模型
           </DialogDescription>
         </DialogHeader>
         <form class="space-y-4" @submit.prevent="submit">
@@ -429,7 +542,7 @@ const statusBadge = (s: string) =>
             <Button type="submit" :disabled="submitting">
               <CloudUpload v-if="!submitting" />
               <Loader2 v-else class="animate-spin" />
-              {{ submitting ? '提交中…' : '创建并开始提取' }}
+              {{ submitting ? '提交中…' : '创建课程' }}
             </Button>
           </DialogFooter>
         </form>
@@ -464,6 +577,77 @@ const statusBadge = (s: string) =>
             保存口令
           </Button>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 视频打标 -->
+    <Dialog v-model:open="markDialog">
+      <DialogContent class="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>视频打标 · {{ markCourse?.title }}</DialogTitle>
+          <DialogDescription>
+            播放视频，在每个动作拍的位置「打点」（或按空格键），为每拍填写口令后生成动作模型
+          </DialogDescription>
+        </DialogHeader>
+        <div class="space-y-3">
+          <div class="overflow-hidden rounded-lg border bg-black">
+            <video
+              ref="markVideoRef"
+              :src="markCourse?.videoPath ?? undefined"
+              controls
+              class="max-h-[44vh] w-full"
+              @timeupdate="currentTime = ($event.target as HTMLVideoElement).currentTime"
+            ></video>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <Button size="sm" @click="addMarker">
+              <MapPinPlus />
+              在当前位置打点（{{ fmtMs(Math.round(currentTime * 1000)) }}）
+            </Button>
+            <span class="text-xs text-muted-foreground">
+              共 {{ markers.length }} 拍 · 播放中按空格键快速打点
+            </span>
+            <div class="ml-auto flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                :disabled="savingMarkers || markers.length === 0"
+                @click="saveMarkers()"
+              >
+                <Loader2 v-if="savingMarkers" class="animate-spin" />
+                保存打标
+              </Button>
+              <Button
+                size="sm"
+                :disabled="generating || markers.length === 0"
+                @click="generateModel"
+              >
+                <Wand2 />
+                生成动作模型
+              </Button>
+            </div>
+          </div>
+          <div class="max-h-48 space-y-1.5 overflow-y-auto rounded-lg border p-2">
+            <p v-if="markers.length === 0" class="py-6 text-center text-sm text-muted-foreground">
+              还没有打点：播放视频到动作拍位置，点击上方按钮打点
+            </p>
+            <div v-for="(m, i) in markers" :key="m.tMs" class="flex items-center gap-2 text-sm">
+              <span class="w-14 shrink-0 font-mono text-xs text-muted-foreground">
+                {{ fmtMs(m.tMs) }}
+              </span>
+              <span class="w-12 shrink-0 text-xs text-muted-foreground">第{{ i + 1 }}拍</span>
+              <Input v-model="m.cue" :placeholder="`第 ${i + 1} 拍动作要领（可选）`" class="h-8" />
+              <Button
+                size="icon"
+                variant="ghost"
+                class="size-8 shrink-0 text-destructive"
+                @click="removeMarker(i)"
+              >
+                <X class="size-4" />
+              </Button>
+            </div>
+          </div>
+        </div>
       </DialogContent>
     </Dialog>
 

@@ -26,15 +26,17 @@
 
 ## 2. 关键设计决策
 
-### 2.1 课程模型 = 模板法（一期，M3 已落地） + 深度学习（二期预留）
+### 2.1 课程模型 = 人工打标 + 模板法（已落地） + 深度学习（二期预留）
 
-**一期（模板法，无需 GPU 训练）：**
+**一期（模板法，无需 GPU 训练；打标采用人工模式）：**
 
 ```
-管理端上传示范视频 ─► Node 存储并创建 TrainingJob ─► HTTP 触发 Python /api/extract
-    └► YOLO 逐帧关键点(15fps采样) ─► EMA平滑 ─► 髋原点/躯干尺度归一化
-    └► 姿态变化速率峰值切分关键帧(≥1.5s间隔, ≤24拍) ─► 课程模型 JSON + 封面图
-    └► 回调 Node PATCH /api/internal/jobs/:id（进度/结果）→ 落库 course_models
+管理端上传示范视频（不自动切分）
+  └► 管理员在视频预览中人工打标（播放器 + 打点按钮/空格键 + 每拍口令）→ PUT markers
+  └► 「生成动作模型」POST /generate-model → Python /api/extract-markers
+      └► 按打点时间戳定点提取姿态（打点前后 0.7s 采样取最优帧）
+      └► 归一化 + 关节角度模板 + 容差 + 口令 → 课程模型 JSON + 封面
+      └► 回调 Node PATCH /api/internal/jobs/:id（进度/结果）→ 落库 course_models
 
 用户训练(start_course) ─► Python 拉取模型 GET /api/internal/courses/:id/model
     └► 每帧：lookahead 窗口内最近关键帧匹配（单调推进，≤6拍跳跃）
@@ -43,14 +45,15 @@
 ```
 
 - 归一化：髋中点为原点、肩髋距离为尺度，消除相机距离与机位差异
-- 课程模型 JSON（存 `ai/data/models/`，元数据在 `course_models` 表）：
-  `{ version, sample_fps, duration_ms, keyframes: [{ index, t_ms, pose: 17×3, angles, tolerance, cue }] }`
-- 口令 `cue` 目前自动生成"第 N 拍"，管理端编辑关键帧口令在 M4 提供
+- 打标暂存于 `Course.markersJson`（生成模型前可反复调整）；模型 JSON 存
+  `ai/data/models/`，元数据在 `course_models` 表：
+  `{ version, duration_ms, keyframes: [{ index, t_ms, pose: 17×3, angles, tolerance, cue }] }`
+- 某打点检测不到人体时自动跳过（全部失败则任务报错），模型拍数可能少于打点数
 - 服务间鉴权：共享 `INTERNAL_TOKEN`（X-Internal-Token 头）
 
-**二期（预留）：** ST-GCN / LSTM 动作分类，用于招式识别等高级功能。
-模型文件走同一 `course_models` 表，`type` 字段区分 template / dnn；
-训练结束后的整段 DTW 对齐报告也在 M4 增强。
+**二期（预留）：** ST-GCN / LSTM 动作分类，用于招式识别等高级功能；
+"AI 建议打点"（速率峰值预填标记，人工确认）也可作为辅助功能加入。
+模型文件走同一 `course_models` 表，`type` 字段区分 template / dnn。
 
 ### 2.2 实时训练协议（WebSocket，M2 已落地）
 

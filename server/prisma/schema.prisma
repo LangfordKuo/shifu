@@ -47,6 +47,7 @@ model Course {
   category    String   @default("general")
   coverUrl    String?
   videoPath   String?
+  markersJson String? // 人工打标的关键帧标记 [{tMs, cue}]（模型生成前暂存）
   status      String   @default("DRAFT")
   createdById Int
   createdBy   User     @relation(fields: [createdById], references: [id])

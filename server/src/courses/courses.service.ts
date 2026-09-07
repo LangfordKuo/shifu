@@ -24,6 +24,10 @@ export class CoursesService {
 
   // ---------- 管理端 ----------
 
+  /**
+   * 创建课程：仅保存视频与信息（DRAFT），不自动提取。
+   * 管理员在前台「打标」标记每一拍后，再调用 generateModel 生成动作模型。
+   */
   async create(dto: CreateCourseDto, file: Express.Multer.File, userId: number) {
     const course = await this.prisma.course.create({
       data: {
@@ -31,20 +35,79 @@ export class CoursesService {
         description: dto.description,
         category: dto.category ?? 'general',
         videoPath: `/api/uploads/videos/${file.filename}`,
-        status: COURSE_STATUS.TRAINING,
+        status: COURSE_STATUS.DRAFT,
         createdById: userId,
       },
     });
+    return this.findOneAdmin(course.id);
+  }
+
+  /** 打标：读取人工标记的关键帧时间点 */
+  async getMarkers(id: number) {
+    const course = await this.prisma.course.findUnique({ where: { id } });
+    if (!course) throw new NotFoundException('课程不存在');
+    let markers = [];
+    if (course.markersJson) {
+      try {
+        markers = JSON.parse(course.markersJson);
+      } catch {
+        markers = [];
+      }
+    }
+    return { markers, videoPath: course.videoPath };
+  }
+
+  /** 打标：保存人工标记的关键帧时间点 */
+  async saveMarkers(
+    id: number,
+    markers: Array<{ tMs: number; cue?: string }>,
+  ) {
+    const course = await this.prisma.course.findUnique({ where: { id } });
+    if (!course) throw new NotFoundException('课程不存在');
+    if (course.status === COURSE_STATUS.PUBLISHED) {
+      throw new BadRequestException('课程已发布，请先下架再修改打标');
+    }
+    const sorted = [...markers].sort((a, b) => a.tMs - b.tMs);
+    await this.prisma.course.update({
+      where: { id },
+      data: { markersJson: JSON.stringify(sorted) },
+    });
+    return { saved: sorted.length };
+  }
+
+  /** 按已保存的打标生成动作模型（异步任务，进度见 TrainingJob） */
+  async generateModel(id: number) {
+    const course = await this.prisma.course.findUnique({ where: { id } });
+    if (!course) throw new NotFoundException('课程不存在');
+    if (!course.videoPath) throw new BadRequestException('课程没有示范视频');
+    if (course.status === COURSE_STATUS.TRAINING) {
+      throw new BadRequestException('正在生成中，请稍候');
+    }
+
+    let markers: Array<{ tMs: number; cue?: string }> = [];
+    if (course.markersJson) {
+      try {
+        markers = JSON.parse(course.markersJson);
+      } catch {
+        markers = [];
+      }
+    }
+    if (markers.length === 0) {
+      throw new BadRequestException('请先在视频预览中打标，再生成动作模型');
+    }
 
     const job = await this.prisma.trainingJob.create({
-      data: { courseId: course.id, type: 'EXTRACT', status: JOB_STATUS.RUNNING },
+      data: { courseId: id, type: 'EXTRACT', status: JOB_STATUS.RUNNING },
+    });
+    await this.prisma.course.update({
+      where: { id },
+      data: { status: COURSE_STATUS.TRAINING },
     });
 
-    // 触发 Python 提取关键帧（失败则任务标记 FAILED，可重试）
     try {
       const aiBase = this.config.get('AI_BASE_URL', 'http://localhost:8000');
       const token = this.config.getOrThrow<string>('INTERNAL_TOKEN');
-      const resp = await fetch(`${aiBase}/api/extract`, {
+      const resp = await fetch(`${aiBase}/api/extract-markers`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -52,9 +115,10 @@ export class CoursesService {
         },
         body: JSON.stringify({
           job_id: job.id,
-          course_id: course.id,
-          video_path: path.resolve(this.uploadRoot(), 'videos', file.filename),
+          course_id: id,
+          video_path: path.resolve(this.uploadRoot(), course.videoPath.replace('/api/uploads/', '')),
           uploads_root: this.uploadRoot(),
+          markers,
         }),
       });
       if (!resp.ok) throw new Error(`AI 服务响应 ${resp.status}`);
@@ -67,12 +131,12 @@ export class CoursesService {
         },
       });
       await this.prisma.course.update({
-        where: { id: course.id },
+        where: { id },
         data: { status: COURSE_STATUS.DRAFT },
       });
     }
 
-    return this.findOneAdmin(course.id);
+    return this.findOneAdmin(id);
   }
 
   async findAllAdmin() {

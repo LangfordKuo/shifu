@@ -1,4 +1,4 @@
-"""课程模型提取接口：Node 创建课程后触发，后台线程执行，HTTP 回调进度。"""
+"""课程模型提取接口：管理员人工打标后，按标记时间戳定点提取。"""
 
 from __future__ import annotations
 
@@ -6,21 +6,27 @@ import logging
 import threading
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
-from app.engine.extractor import ExtractError, extract, save_model
+from app.engine.extractor import ExtractError, extract_at_markers, save_model
 from app.internal_client import update_job
 
 logger = logging.getLogger("shifu.ai.extract")
 router = APIRouter()
 
 
-class ExtractRequest(BaseModel):
+class Marker(BaseModel):
+    tMs: int = Field(ge=0)
+    cue: str = ""
+
+
+class ExtractMarkersRequest(BaseModel):
     job_id: int
     course_id: int
     video_path: str
     uploads_root: str
+    markers: list[Marker] = Field(min_length=1)
 
 
 def _check_token(token: str | None) -> None:
@@ -29,19 +35,21 @@ def _check_token(token: str | None) -> None:
         raise HTTPException(status_code=403, detail="内部令牌无效")
 
 
-@router.post("/api/extract")
-def trigger_extract(
-    req: ExtractRequest,
+@router.post("/api/extract-markers")
+def trigger_extract_markers(
+    req: ExtractMarkersRequest,
     x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
 ):
     _check_token(x_internal_token)
+    markers = sorted(req.markers, key=lambda m: m.tMs)
 
     def run() -> None:
         try:
-            result = extract(
+            result = extract_at_markers(
                 req.video_path,
                 req.uploads_root,
                 req.job_id,
+                [m.model_dump() for m in markers],
                 on_progress=lambda p: update_job(req.job_id, status="RUNNING", progress=p),
             )
             model_path = save_model(result["model"], req.course_id)
@@ -56,7 +64,12 @@ def trigger_extract(
                     "coverUrl": result["cover_url"],
                 },
             )
-            logger.info("课程 %s 提取完成：%s 个关键帧", req.course_id, result["model"]["keyframe_count"])
+            logger.info(
+                "课程 %s 提取完成：%s 个关键帧（跳过 %s 个无效打点）",
+                req.course_id,
+                result["model"]["keyframe_count"],
+                len(result["skipped"]),
+            )
         except ExtractError as e:
             logger.warning("课程 %s 提取失败：%s", req.course_id, e)
             update_job(req.job_id, status="FAILED", error=str(e))

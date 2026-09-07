@@ -10,6 +10,7 @@ import {
   Put,
   UploadedFile,
   UseInterceptors,
+  Req,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -20,6 +21,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray,
   IsInt,
+  IsOptional,
   IsString,
   MaxLength,
   Min,
@@ -27,7 +29,6 @@ import {
 } from 'class-validator';
 import { CoursesService } from './courses.service';
 import { Roles } from '../common/decorators/roles.decorator';
-import { Req } from '@nestjs/common';
 import { ROLE } from '../common/constants';
 import { CreateCourseDto, UpdateCourseDto } from './dto/courses.dto';
 
@@ -46,6 +47,24 @@ class UpdateCuesDto {
   @ValidateNested({ each: true })
   @Type(() => CueItemDto)
   cues!: CueItemDto[];
+}
+
+class MarkerDto {
+  @IsInt()
+  @Min(0)
+  tMs!: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  cue?: string;
+}
+
+class SaveMarkersDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => MarkerDto)
+  markers!: MarkerDto[];
 }
 
 const VIDEO_RE = /\.(mp4|mov|avi|mkv|webm)$/i;
@@ -91,6 +110,24 @@ export class AdminCoursesController {
     return this.coursesService.findOneAdmin(id);
   }
 
+  /** 读取人工打标 */
+  @Get(':id/markers')
+  getMarkers(@Param('id', ParseIntPipe) id: number) {
+    return this.coursesService.getMarkers(id);
+  }
+
+  /** 保存人工打标（打点时间 + 口令） */
+  @Put(':id/markers')
+  saveMarkers(@Param('id', ParseIntPipe) id: number, @Body() dto: SaveMarkersDto) {
+    return this.coursesService.saveMarkers(id, dto.markers);
+  }
+
+  /** 按打标生成动作模型（异步任务） */
+  @Post(':id/generate-model')
+  generateModel(@Param('id', ParseIntPipe) id: number) {
+    return this.coursesService.generateModel(id);
+  }
+
   /** 关键帧清单（供口令编辑） */
   @Get(':id/keyframes')
   getKeyframes(@Param('id', ParseIntPipe) id: number) {
@@ -105,7 +142,7 @@ export class AdminCoursesController {
     return this.coursesService.updateCues(id, dto.cues);
   }
 
-  /** 创建课程：上传示范视频并自动触发关键帧提取 */
+  /** 创建课程：仅上传视频与信息，打标后在列表中生成动作模型 */
   @Post()
   @UseInterceptors(
     FileInterceptor('video', {
@@ -123,7 +160,6 @@ export class AdminCoursesController {
     @Req() req: { user: { id: number } },
   ) {
     if (!file) {
-      // eslint-disable-next-line @typescript-eslint/no-throw-literal
       throw new Error('请上传示范视频');
     }
     return this.coursesService.create(dto, file, req.user.id);
