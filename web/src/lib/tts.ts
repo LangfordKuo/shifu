@@ -30,3 +30,15 @@ export function speak(text: string, enabled: boolean) {
 export function stopSpeaking() {
   if (ttsSupported()) window.speechSynthesis.cancel();
 }
+
+/** 立即播报（打断当前语音，用于阶段切换口令等高优先级场景） */
+export function speakNow(text: string, enabled: boolean) {
+  if (!enabled || !ttsSupported() || !text) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = 'zh-CN';
+  utter.rate = 1.1;
+  lastText = text;
+  lastAt = Date.now();
+  window.speechSynthesis.speak(utter);
+}

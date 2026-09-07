@@ -15,6 +15,8 @@ export default defineConfig({
     proxy: {
       // 业务 API -> NestJS
       '/api': { target: 'http://localhost:3000', changeOrigin: true },
+      // 上传的静态资源（视频 / 课程封面）-> NestJS
+      '/uploads': { target: 'http://localhost:3000', changeOrigin: true },
       // AI 服务 -> Python FastAPI（含 WebSocket）
       '/ai': {
         target: 'http://localhost:8000',

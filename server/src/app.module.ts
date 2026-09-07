@@ -4,6 +4,9 @@ import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
+import { CoursesModule } from './courses/courses.module';
+import { InternalModule } from './internal/internal.module';
+import { TrainingModule } from './training/training.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 
@@ -13,6 +16,9 @@ import { RolesGuard } from './common/guards/roles.guard';
     PrismaModule,
     AuthModule,
     UsersModule,
+    CoursesModule,
+    InternalModule,
+    TrainingModule,
   ],
   providers: [
     // 全局守卫：先鉴权（可用 @Public() 跳过），再校验角色（可用 @Roles() 声明）

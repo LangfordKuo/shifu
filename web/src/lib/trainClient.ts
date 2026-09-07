@@ -16,6 +16,15 @@ export interface ScoreItem {
   angle: number | null;
 }
 
+export interface Deviation {
+  joint: string;
+  name: string;
+  target: number;
+  actual: number;
+  delta: number;
+  text: string;
+}
+
 export interface TrainResult {
   type: 'result';
   landmarks?: Landmark[];
@@ -25,6 +34,14 @@ export interface TrainResult {
   suggestions?: string[];
   inference_ms?: number;
   error?: string;
+  // ---- 课程模式字段 ----
+  phase?: number;
+  phase_total?: number;
+  cue?: string;
+  phase_changed?: boolean;
+  match_score?: number;
+  progress?: number;
+  deviations?: Deviation[];
 }
 
 export type WsMessage =
@@ -141,6 +158,37 @@ export class TrainClient {
 
   sendReset() {
     if (this.isConnected) this.ws!.send(JSON.stringify({ type: 'reset' }));
+  }
+
+  /** 发送控制消息并等待指定类型响应（超时/错误返回 null） */
+  sendAndWait<T = { type: string }>(
+    msg: object,
+    expectType: string,
+    timeoutMs = 10000,
+  ): Promise<T | null> {
+    if (!this.isConnected) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const ws = this.ws!;
+      const handler = (ev: MessageEvent) => {
+        let data: { type: string } | null = null;
+        try {
+          data = JSON.parse(ev.data as string);
+        } catch {
+          return;
+        }
+        if (data && (data.type === expectType || data.type === 'error')) {
+          ws.removeEventListener('message', handler);
+          clearTimeout(timer);
+          resolve(data.type === 'error' ? null : (data as T));
+        }
+      };
+      const timer = setTimeout(() => {
+        ws.removeEventListener('message', handler);
+        resolve(null);
+      }, timeoutMs);
+      ws.addEventListener('message', handler);
+      ws.send(JSON.stringify(msg));
+    });
   }
 
   close() {

@@ -26,25 +26,31 @@
 
 ## 2. 关键设计决策
 
-### 2.1 课程模型 = 模板法（一期） + 深度学习（二期预留）
+### 2.1 课程模型 = 模板法（一期，M3 已落地） + 深度学习（二期预留）
 
 **一期（模板法，无需 GPU 训练）：**
 
 ```
-示范视频 ─► YOLO 逐帧关键点 ─► 平滑/归一化 ─► 自动切分关键帧 ─► 课程模型 JSON
-                                                                    │
-用户实时帧 ─► YOLO 关键点 ─► 与"当前进度关键帧"比对 ─► 超差关节 ─► TTS 建议
-                └──────────── DTW 序列对齐 ─► 进度/节奏/总分 ─► 训练报告
+管理端上传示范视频 ─► Node 存储并创建 TrainingJob ─► HTTP 触发 Python /api/extract
+    └► YOLO 逐帧关键点(15fps采样) ─► EMA平滑 ─► 髋原点/躯干尺度归一化
+    └► 姿态变化速率峰值切分关键帧(≥1.5s间隔, ≤24拍) ─► 课程模型 JSON + 封面图
+    └► 回调 Node PATCH /api/internal/jobs/:id（进度/结果）→ 落库 course_models
+
+用户训练(start_course) ─► Python 拉取模型 GET /api/internal/courses/:id/model
+    └► 每帧：lookahead 窗口内最近关键帧匹配（单调推进，≤6拍跳跃）
+    └► 阶段切换 → TTS 口令播报；单关节偏差>15° → 纠偏建议（如"左肘再打开一些（目标约160°，当前120°）"）
+    └► 综合分 = 五要领规范分 ×0.5 + 关键帧匹配分 ×0.5；结束上报 TrainingSession
 ```
 
 - 归一化：髋中点为原点、肩髋距离为尺度，消除相机距离与机位差异
-- 关键帧切分：按姿态变化速率（相邻帧角度向量距离）找极值点
-- 课程模型 JSON（存 `data/models/`，元数据在 `course_models` 表）：
-  `{ meta, keyframes: [{ t, pose: 17×3, angles, tolerance, cue_text }], global_rules }`
-- 优点：确定性、可解释、CPU 可跑、当天出模型；后续管理端可人工微调关键帧与口令
+- 课程模型 JSON（存 `ai/data/models/`，元数据在 `course_models` 表）：
+  `{ version, sample_fps, duration_ms, keyframes: [{ index, t_ms, pose: 17×3, angles, tolerance, cue }] }`
+- 口令 `cue` 目前自动生成"第 N 拍"，管理端编辑关键帧口令在 M4 提供
+- 服务间鉴权：共享 `INTERNAL_TOKEN`（X-Internal-Token 头）
 
 **二期（预留）：** ST-GCN / LSTM 动作分类，用于招式识别等高级功能。
-模型文件走同一 `course_models` 表，`type` 字段区分 template / dnn。
+模型文件走同一 `course_models` 表，`type` 字段区分 template / dnn；
+训练结束后的整段 DTW 对齐报告也在 M4 增强。
 
 ### 2.2 实时训练协议（WebSocket，M2 已落地）
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { useRoute } from 'vue-router';
 import {
   Camera,
   CameraOff,
@@ -14,8 +15,8 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { drawSkeleton } from '@/lib/skeleton';
-import { loadTokens } from '@/lib/api';
-import { speak, stopSpeaking, ttsSupported } from '@/lib/tts';
+import { api, loadTokens } from '@/lib/api';
+import { speak, speakNow, stopSpeaking, ttsSupported } from '@/lib/tts';
 import {
   TrainClient,
   type ScoreItem,
@@ -36,14 +37,18 @@ const ANGLE_LABELS: Array<[string, string]> = [
 ];
 
 // ---------- 状态 ----------
+const route = useRoute();
+const courseId = Number(route.query.course) || null;
+const courseInfo = ref<{ title: string; keyframeCount: number } | null>(null);
+
 const phase = ref<'idle' | 'starting' | 'running'>('idle');
 const demoActive = ref(false); // 演示图片结果展示中（隐藏摄像头占位提示）
 const noPerson = ref(false);
 const soundOn = ref(ttsSupported());
-const fps = ref(0);
-const latency = ref(0); // 帧round-trip毫秒
-const inferenceMs = ref(0);
 const wsMsg = ref('');
+const fps = ref(0);
+const latency = ref(0);
+const inferenceMs = ref(0);
 
 const videoRef = ref<HTMLVideoElement | null>(null);
 const canvasRef = ref<HTMLCanvasElement | null>(null);
@@ -55,11 +60,27 @@ const result = reactive({
   suggestions: [] as string[],
 });
 
+// 课程训练状态
+const course = reactive({
+  phase: 0,
+  phaseTotal: 0,
+  cue: '',
+  progress: 0,
+  match: 0,
+});
+
+// 会话统计（课程模式结束时报给后端）
+let sessionStart = 0;
+let courseScoreSum = 0;
+let courseScoreN = 0;
+let maxPhase = 0;
+
 let client: TrainClient | null = null;
 let stream: MediaStream | null = null;
 let running = false;
 let demoImg: HTMLImageElement | null = null;
 let fpsCount = 0;
+let fpsTimer: number | null = null;
 
 const circ = 2 * Math.PI * 52;
 const scoreOffset = computed(() => circ * (1 - result.score / 100));
@@ -79,6 +100,16 @@ function angleText(key: string) {
   const v = result.angles[key];
   return v === undefined || v < 0 ? '—' : `${v.toFixed(0)}°`;
 }
+
+// ---------- 课程信息预取 ----------
+onMounted(async () => {
+  if (!courseId) return;
+  try {
+    courseInfo.value = await api.get(`/courses/${courseId}`);
+  } catch {
+    toast.error('课程加载失败，已切换为自由训练');
+  }
+});
 
 // ---------- 启动 / 停止 ----------
 async function startTraining() {
@@ -114,14 +145,33 @@ async function startTraining() {
       throw new Error(wsMsg.value || '无法连接 AI 服务');
     }
 
-    // 3. 进入推理循环
+    // 3. 课程模式：加载课程模型
+    if (courseId && courseInfo.value) {
+      const loaded = await client.sendAndWait<{ phase_total: number }>(
+        { type: 'start_course', courseId },
+        'course_loaded',
+        15000,
+      );
+      if (!loaded) throw new Error('课程模型加载失败');
+      course.phase = 0;
+      course.phaseTotal = loaded.phase_total;
+      course.cue = '准备';
+      course.progress = 0;
+      course.match = 0;
+    }
+
+    // 4. 进入推理循环
     running = true;
     phase.value = 'running';
     noPerson.value = false;
     fpsCount = 0;
+    sessionStart = Date.now();
+    courseScoreSum = 0;
+    courseScoreN = 0;
+    maxPhase = 0;
     void frameLoop();
 
-    setInterval(() => {
+    fpsTimer = window.setInterval(() => {
       fps.value = fpsCount;
       fpsCount = 0;
     }, 1000);
@@ -138,10 +188,16 @@ async function startTraining() {
   }
 }
 
+
 async function stopTraining() {
+  const hadCourseRun = courseId && courseScoreN > 0;
   running = false;
   phase.value = 'idle';
   demoActive.value = false;
+  if (fpsTimer) {
+    clearInterval(fpsTimer);
+    fpsTimer = null;
+  }
   if (stream) {
     stream.getTracks().forEach((t) => t.stop());
     stream = null;
@@ -150,12 +206,34 @@ async function stopTraining() {
   client?.close();
   client = null;
   stopSpeaking();
+
+  // 课程模式：上报训练会话
+  if (hadCourseRun) {
+    const avg = courseScoreSum / courseScoreN;
+    api
+      .post('/training/sessions', {
+        courseId,
+        score: Number(avg.toFixed(1)),
+        durationMs: Date.now() - sessionStart,
+        report: {
+          phases: maxPhase,
+          phaseTotal: course.phaseTotal,
+          frames: courseScoreN,
+        },
+      })
+      .then(() => toast.info('本次训练已记录'))
+      .catch(() => {});
+  }
+
   const canvas = canvasRef.value;
   canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
   result.score = 0;
   result.items = [];
   result.suggestions = [];
   result.angles = {};
+  course.phase = 0;
+  course.cue = '';
+  course.progress = 0;
   fps.value = 0;
   latency.value = 0;
 }
@@ -241,8 +319,30 @@ function handleResult(res: TrainResult) {
   result.angles = res.angles ?? {};
   result.items = res.items ?? [];
   result.suggestions = res.suggestions ?? [];
-  const first = result.suggestions[0];
-  if (first) speak(first, soundOn.value);
+
+  // 课程模式：阶段进度与口令
+  if (typeof res.phase === 'number') {
+    course.phase = res.phase;
+    course.phaseTotal = res.phase_total ?? course.phaseTotal;
+    course.cue = res.cue ?? course.cue;
+    course.progress = res.progress ?? course.progress;
+    course.match = res.match_score ?? course.match;
+    // 仅真实摄像头训练计入会话统计（演示图片不计入）
+    if (running) {
+      // 综合分 = 动作规范(五要领) 与 关键帧匹配 各半
+      courseScoreSum += (res.score ?? 0) * 0.5 + (res.match_score ?? 0) * 0.5;
+      courseScoreN += 1;
+      if (res.phase > maxPhase) maxPhase = res.phase;
+    }
+
+    if (res.phase_changed) {
+      speakNow(res.cue ?? '', soundOn.value);
+    } else if (result.suggestions[0]) {
+      speak(result.suggestions[0], soundOn.value);
+    }
+  } else if (result.suggestions[0]) {
+    speak(result.suggestions[0], soundOn.value);
+  }
 }
 
 // ---------- 演示图片 ----------
@@ -278,6 +378,15 @@ async function runDemo() {
       const ok = await client.connect();
       if (!ok) throw new Error(wsMsg.value || '无法连接 AI 服务');
     }
+    if (courseId && courseInfo.value) {
+      const loaded = await client.sendAndWait<{ phase_total: number }>(
+        { type: 'start_course', courseId },
+        'course_loaded',
+        15000,
+      );
+      if (!loaded) throw new Error('课程模型加载失败');
+      course.phaseTotal = loaded.phase_total;
+    }
     const jpeg = await captureJpeg();
     if (jpeg) {
       const res = await client.sendFrame(jpeg);
@@ -297,7 +406,7 @@ async function runDemo() {
       <div>
         <h1 class="text-2xl font-bold">开始训练</h1>
         <p class="text-sm text-muted-foreground">
-          摄像头实时动作识别 · 五要领评分 · 语音纠偏（自由训练模式）
+          {{ courseId && courseInfo ? `课程训练 · ${courseInfo.title}` : '自由训练 · 通用五要领评分' }}
         </p>
       </div>
       <div class="flex items-center gap-2">
@@ -323,6 +432,36 @@ async function runDemo() {
         </Button>
       </div>
     </div>
+
+    <!-- 课程进度条 -->
+    <Card v-if="courseId && courseInfo" class="mb-4 border-primary/40">
+      <CardContent class="flex flex-wrap items-center justify-between gap-4 py-4">
+        <div>
+          <div class="text-xs text-muted-foreground">课程进度</div>
+          <div class="text-lg font-bold">
+            {{ course.phase || 0 }}
+            <span class="text-sm font-normal text-muted-foreground">/ {{ course.phaseTotal || courseInfo.keyframeCount }} 拍</span>
+          </div>
+        </div>
+        <div class="min-w-40 flex-1">
+          <div class="mb-1 text-center text-xl font-semibold text-primary">
+            {{ course.cue || '准备开始' }}
+          </div>
+          <div class="h-2 overflow-hidden rounded-full bg-muted">
+            <div
+              class="h-full rounded-full bg-primary transition-all duration-300"
+              :style="{ width: (course.progress || 0) * 100 + '%' }"
+            ></div>
+          </div>
+        </div>
+        <div class="text-right">
+          <div class="text-xs text-muted-foreground">动作匹配</div>
+          <div class="text-lg font-bold" :style="{ color: scoreColor(course.match) }">
+            {{ course.match ? course.match.toFixed(0) : '—' }}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
 
     <div class="grid gap-4 lg:grid-cols-3">
       <!-- 左：画面 -->
@@ -414,7 +553,9 @@ async function runDemo() {
               <div class="text-lg font-semibold" :style="{ color: scoreColor(result.score) }">
                 {{ result.score ? scoreText(result.score) : '等待训练' }}
               </div>
-              <div class="text-xs text-muted-foreground">通用五要领评分</div>
+              <div class="text-xs text-muted-foreground">
+                {{ courseId ? '规范 + 匹配综合评分' : '通用五要领评分' }}
+              </div>
             </div>
           </CardContent>
         </Card>

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     # 与 server/.env 的 JWT_SECRET 保持一致（WS 鉴权用）
     jwt_secret: str = "change-me-to-a-random-64-hex-string"
 
+    # 与 server/.env 的 INTERNAL_TOKEN 保持一致（服务间内部调用鉴权）
+    internal_token: str = "change-me-internal-token"
+
+    # Node 业务服务地址（回调任务进度 / 拉取课程模型）
+    node_base_url: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:
