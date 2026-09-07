@@ -1,12 +1,15 @@
-"""课程会话引擎：实时帧与课程关键帧的最近段跟踪 + 偏差纠正建议。
+"""课程会话引擎：实时帧与课程关键帧的达标保持 + 等待推进。
 
-一期采用"单调推进的最近邻匹配"（lookahead 窗口内搜索最相似关键帧），
-替代完整 DTW 以满足实时性；训练结束后的整段 DTW 对齐在 M4 增强。
+进度推进模式（区别于"姿势一匹配就跳下一拍"）：
+1. 学员当前姿态与当前拍关键帧匹配分 ≥ HOLD_TH → 判定"动作完成"（hold_done）
+2. 完成后等待 wait_ms（训练界面可设置，默认 3 秒）
+3. 等待结束自动进入下一拍并播报口令；最后一拍完成则整套结束
 """
 
 from __future__ import annotations
 
 import random
+import time
 from typing import Any
 
 # 纠偏口令表：joint -> (名称, 目标>当前时的候选说法, 目标<当前时的候选说法)
@@ -40,7 +43,7 @@ _PHRASES: dict[str, tuple[str, list[str], list[str]]] = {
     "right_hip": (
         "右胯",
         ["右胯再松沉一些", "沉一沉右胯"],
-        ["右胯收回来一些", "注意收右胯"],
+        ["左胯收回来一些", "注意收右胯"],
     ),
     "left_knee": (
         "左膝",
@@ -61,8 +64,10 @@ PRAISE_POOL = [
     "棒，就是这个感觉",
 ]
 
-LOOKAHEAD = 6  # 允许向前跳跃匹配的关键帧数
-ENTER_TH = 18.0  # 平均角度差小于该值（度）视为到达
+# 匹配分达到达标线（默认 75 ≈ 关节平均偏差 10°）判定当前动作完成，
+# 训练界面可调（50-95）
+DEFAULT_HOLD_TH = 75.0
+DEFAULT_WAIT_MS = 3000
 MATCH_TH = 15.0  # 单关节偏差超过该值（度）才纠偏
 GOOD_MATCH_TH = 80.0  # 视为"做得好"的匹配分阈值
 MAX_DEVIATIONS = 3
@@ -104,39 +109,108 @@ def _deviations(
 
 
 class CourseSession:
-    def __init__(self, course: dict[str, Any], model: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        course: dict[str, Any],
+        model: dict[str, Any],
+        wait_ms: int = DEFAULT_WAIT_MS,
+        hold_th: float = DEFAULT_HOLD_TH,
+    ) -> None:
         self.course = course
         self.keyframes: list[dict[str, Any]] = model["keyframes"]
         self.duration_ms = model.get("duration_ms", 0)
+        self.wait_ms = max(0, int(wait_ms))
+        self.hold_th = min(95.0, max(50.0, float(hold_th)))
         self.cursor = 0
+        self.completed = False  # 当前拍姿态已达标
+        self.completed_at = 0.0  # 达标时刻（monotonic）
+        self.pending_advance = False  # 跳过此拍：下一帧强制推进
+        self.session_done = False  # 整套动作已完成
 
     @property
     def total(self) -> int:
         return len(self.keyframes)
 
+    def set_wait(self, wait_ms: int) -> None:
+        self.wait_ms = max(0, int(wait_ms))
+
+    def set_hold_th(self, hold_th: float) -> None:
+        self.hold_th = min(95.0, max(50.0, float(hold_th)))
+
+    def reset(self) -> None:
+        self.cursor = 0
+        self.completed = False
+        self.completed_at = 0.0
+        self.pending_advance = False
+        self.session_done = False
+
+    def skip_phase(self) -> None:
+        """跳过当前拍：直接推进（最后一拍则整套结束）。"""
+        if self.session_done:
+            return
+        self.pending_advance = True
+
     def update(self, angles: dict[str, float]) -> dict[str, Any]:
         """输入当前帧角度，返回课程匹配结果。"""
-        dists = {i: _angle_distance(angles, kf["angles"]) for i, kf in enumerate(self.keyframes)}
-        best, best_d = self.cursor, dists[self.cursor]
-        hi = min(self.total, self.cursor + 1 + LOOKAHEAD)
-        for i in range(self.cursor + 1, hi):
-            if dists[i] < best_d:
-                best, best_d = i, dists[i]
-        phase_changed = best > self.cursor and best_d <= ENTER_TH
-        if phase_changed:
-            self.cursor = best
+        now = time.monotonic()
+        dists = {
+            i: _angle_distance(angles, kf["angles"])
+            for i, kf in enumerate(self.keyframes)
+        }
+
+        d = dists[self.cursor]
+        match_score = round(max(0.0, 100 - d * 2.5), 1)
+        deviations = _deviations(angles, self.keyframes[self.cursor]["angles"])
+
+        phase_changed = False
+        finished = False
+        hold_done = False
+        hold_remaining: int | None = None
+
+        if not self.session_done:
+            if self.pending_advance:
+                # 跳过此拍
+                self.pending_advance = False
+                self.completed = False
+                self.completed_at = 0.0
+                if self.cursor < self.total - 1:
+                    self.cursor += 1
+                    phase_changed = True
+                else:
+                    self.session_done = True
+                    finished = True
+            elif not self.completed:
+                # 等待当前姿态达标
+                if match_score >= self.hold_th:
+                    self.completed = True
+                    self.completed_at = now
+                    hold_done = True
+            else:
+                # 已达标：等待 wait_ms 后进入下一拍
+                elapsed_ms = (now - self.completed_at) * 1000
+                remaining = self.wait_ms - elapsed_ms
+                if remaining <= 0:
+                    self.completed = False
+                    self.completed_at = 0.0
+                    if self.cursor < self.total - 1:
+                        self.cursor += 1
+                        phase_changed = True
+                    else:
+                        self.session_done = True
+                        finished = True
+                else:
+                    hold_remaining = int(remaining)
 
         kf = self.keyframes[self.cursor]
-        match_score = round(max(0.0, 100 - dists[self.cursor] * 2.5), 1)
-        deviations = _deviations(angles, kf["angles"])
-        finished = phase_changed and self.cursor == self.total - 1
-
         return {
             "phase": kf["index"],
             "phase_total": self.total,
             "cue": kf["cue"],
             "phase_changed": phase_changed,
             "finished": finished,
+            "session_done": self.session_done,
+            "hold_done": hold_done,
+            "hold_remaining_ms": hold_remaining,
             "match_score": match_score,
             "progress": round((self.cursor + 1) / self.total, 3),
             "deviations": deviations,

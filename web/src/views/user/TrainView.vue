@@ -14,6 +14,7 @@ import { toast } from 'vue-sonner';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import { drawSkeleton } from '@/lib/skeleton';
 import { api, loadTokens } from '@/lib/api';
 import { speak, speakNow, stopSpeaking, ttsSupported } from '@/lib/tts';
@@ -73,6 +74,10 @@ const course = reactive({
   progress: 0,
   match: 0,
 });
+const holdRemaining = ref<number | null>(null); // 达标后等待进入下一拍的剩余毫秒
+// 完成后等待秒数与达标线（本地记住，训练中可调）
+const waitSec = ref(Math.min(30, Math.max(0, Number(localStorage.getItem('shifu.waitSec')) || 3)));
+const holdTh = ref(Math.min(95, Math.max(50, Number(localStorage.getItem('shifu.holdTh')) || 75)));
 
 // 会话统计（课程模式结束时报给后端）
 let sessionStart = 0;
@@ -170,8 +175,8 @@ async function startTraining() {
 
     // 3. 课程模式：加载课程模型
     if (courseId && courseInfo.value) {
-      const loaded = await client.sendAndWait<{ phase_total: number }>(
-        { type: 'start_course', courseId },
+      const loaded = await client.sendAndWait<{ phase_total: number; waitMs: number }>(
+        { type: 'start_course', courseId, waitMs: waitSec.value * 1000, holdTh: holdTh.value },
         'course_loaded',
         15000,
       );
@@ -181,6 +186,7 @@ async function startTraining() {
       course.cue = '准备';
       course.progress = 0;
       course.match = 0;
+      holdRemaining.value = null;
       resetVoiceState();
       speakNow('准备好，跟随口令开始练习', soundOn.value);
     }
@@ -284,6 +290,7 @@ async function stopTraining() {
   course.cue = '';
   course.progress = 0;
   ghostPose.value = null;
+  holdRemaining.value = null;
   resetVoiceState();
   fps.value = 0;
   latency.value = 0;
@@ -390,6 +397,7 @@ function handleResult(res: TrainResult) {
     course.progress = res.progress ?? course.progress;
     course.match = res.match_score ?? course.match;
     ghostPose.value = res.ghost ?? ghostPose.value;
+    holdRemaining.value = res.hold_remaining_ms ?? null;
     // 仅真实摄像头训练计入会话统计（演示图片不计入）
     if (running) {
       // 综合分 = 动作规范(五要领) 与 关键帧匹配 各半
@@ -411,7 +419,7 @@ function handleResult(res: TrainResult) {
   }
 }
 
-/** 人性化语音策略：口令打断播报；纠偏按关节冷却、去数字口语化；达标低频鼓励 */
+/** 人性化语音策略：口令打断播报；达标播保持提示；纠偏按关节冷却、去数字口语化 */
 function humanizedSpeak(res: TrainResult) {
   if (!soundOn.value) return;
   const now = Date.now();
@@ -426,7 +434,13 @@ function humanizedSpeak(res: TrainResult) {
     return;
   }
 
-  // 2. 纠偏：挑最严重的、且该关节 12 秒内没提醒过的；全局至少间隔 4 秒
+  // 2. 当前拍首次达标：肯定 + 提示保持
+  if (res.hold_done) {
+    speak('很好，保持住', soundOn.value);
+    return;
+  }
+
+  // 3. 纠偏：挑最严重的、且该关节 12 秒内没提醒过的；全局至少间隔 4 秒
   const deviation = (res.deviations ?? []).find(
     (d) => now - (jointLastSpoken.get(d.joint) ?? 0) > 12_000,
   );
@@ -439,13 +453,34 @@ function humanizedSpeak(res: TrainResult) {
     return;
   }
 
-  // 3. 姿态达标且无偏差：低频随机鼓励
+  // 4. 姿态达标且无偏差：低频随机鼓励
   if (res.all_good && now - lastPraiseAt > 20_000 && now - lastAnyAdviceAt > 6_000) {
     speak(PRAISES[praiseIndex % PRAISES.length]!, soundOn.value);
     praiseIndex += 1;
     lastPraiseAt = now;
     lastAnyAdviceAt = now;
   }
+}
+
+// ---------- 等待时长设置与跳过 ----------
+function onWaitChange() {
+  waitSec.value = Math.min(30, Math.max(0, Math.round(Number(waitSec.value) || 0)));
+  localStorage.setItem('shifu.waitSec', String(waitSec.value));
+  client?.sendControl({ type: 'set_wait', waitMs: waitSec.value * 1000 });
+  toast.info(`动作完成后将等待 ${waitSec.value} 秒进入下一拍`);
+}
+
+function onHoldThChange() {
+  holdTh.value = Math.min(95, Math.max(50, Math.round(Number(holdTh.value) || 75)));
+  localStorage.setItem('shifu.holdTh', String(holdTh.value));
+  client?.sendControl({ type: 'set_hold_th', holdTh: holdTh.value });
+  toast.info(`达标线已调整为匹配分 ${holdTh.value} 分`);
+}
+
+function skipPhase() {
+  if (phase.value !== 'running') return;
+  client?.sendControl({ type: 'skip_phase' });
+  holdRemaining.value = null;
 }
 
 // ---------- 演示图片 ----------
@@ -547,12 +582,19 @@ async function runDemo() {
           </div>
         </div>
         <div class="min-w-40 flex-1">
-          <div class="mb-1 text-center text-xl font-semibold text-primary">
-            {{ course.cue || '准备开始' }}
+          <div
+            class="mb-1 text-center text-xl font-semibold"
+            :class="holdRemaining != null ? 'text-green-600' : 'text-primary'"
+          >
+            <template v-if="holdRemaining != null">
+              已达标 · {{ (holdRemaining / 1000).toFixed(1) }}s 后进入下一拍
+            </template>
+            <template v-else>{{ course.cue || '准备开始' }}</template>
           </div>
           <div class="h-2 overflow-hidden rounded-full bg-muted">
             <div
-              class="h-full rounded-full bg-primary transition-all duration-300"
+              class="h-full rounded-full transition-all duration-300"
+              :class="holdRemaining != null ? 'bg-green-600' : 'bg-primary'"
               :style="{ width: (course.progress || 0) * 100 + '%' }"
             ></div>
           </div>
@@ -650,6 +692,31 @@ async function runDemo() {
           >
             示范视频 {{ showDemoVideo ? '开' : '关' }}
           </Button>
+          <div v-if="courseId" class="ml-auto flex items-center gap-1.5 text-sm text-muted-foreground">
+            完成后等待
+            <Input
+              v-model.number="waitSec"
+              type="number"
+              min="0"
+              max="30"
+              class="h-8 w-16"
+              @change="onWaitChange"
+            />
+            秒 · 达标线
+            <Input
+              v-model.number="holdTh"
+              type="number"
+              min="50"
+              max="95"
+              class="h-8 w-16"
+              title="当前拍匹配分达到该值判定动作完成"
+              @change="onHoldThChange"
+            />
+            分
+            <Button size="sm" variant="outline" :disabled="phase !== 'running'" @click="skipPhase">
+              跳过此拍
+            </Button>
+          </div>
         </div>
       </div>
 

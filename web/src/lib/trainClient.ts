@@ -42,6 +42,7 @@ export interface TrainResult {
   cue?: string;
   phase_changed?: boolean;
   finished?: boolean;
+  session_done?: boolean;
   match_score?: number;
   progress?: number;
   deviations?: Deviation[];
@@ -49,6 +50,10 @@ export interface TrainResult {
   ghost?: Array<{ x: number; y: number; v: number }>;
   /** 姿态达标且无偏差 */
   all_good?: boolean;
+  /** 当前拍首次达标（true 仅在达标那一帧） */
+  hold_done?: boolean;
+  /** 达标后等待进入下一拍的剩余毫秒（未达标时为 null） */
+  hold_remaining_ms?: number | null;
 }
 
 export type WsMessage =
@@ -165,6 +170,11 @@ export class TrainClient {
 
   sendReset() {
     if (this.isConnected) this.ws!.send(JSON.stringify({ type: 'reset' }));
+  }
+
+  /** 发送控制消息（set_wait / skip_phase 等，无需等待响应） */
+  sendControl(msg: object) {
+    if (this.isConnected) this.ws!.send(JSON.stringify(msg));
   }
 
   /** 发送控制消息并等待指定类型响应（超时/错误返回 null） */
