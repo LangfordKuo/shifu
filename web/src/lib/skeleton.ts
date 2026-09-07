@@ -36,7 +36,12 @@ interface Pt {
 export function drawSkeleton(
   canvas: HTMLCanvasElement,
   landmarks: Landmark[],
-  opts: { drawGuides?: boolean; background?: HTMLImageElement | null } = {},
+  opts: {
+    drawGuides?: boolean;
+    background?: HTMLImageElement | null;
+    /** 标准姿态（课程关键帧归一化 pose），适配到用户身体后以金色叠加对比 */
+    ghost?: Array<{ x: number; y: number; v: number }> | null;
+  } = {},
 ) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -56,6 +61,50 @@ export function drawSkeleton(
   const ok = (i: number) => landmarks[i] && landmarks[i].v > 0.3;
   const px = (i: number): Pt => ({ x: landmarks[i].x * w, y: landmarks[i].y * h });
   const drawGuides = opts.drawGuides !== false;
+
+  // ---------- 标准姿态叠加（ghost）：适配到用户当前身体位置 ----------
+  if (opts.ghost && ok(5) && ok(6) && ok(11) && ok(12)) {
+    const kp = [px(5), px(6), px(11), px(12)];
+    const hipMid = { x: (kp[2].x + kp[3].x) / 2, y: (kp[2].y + kp[3].y) / 2 };
+    const shMid = { x: (kp[0].x + kp[1].x) / 2, y: (kp[0].y + kp[1].y) / 2 };
+    const torso = Math.hypot(shMid.x - hipMid.x, shMid.y - hipMid.y);
+    if (torso > 8) {
+      const g = opts.ghost;
+      const gok = (i: number) => g[i] && g[i].v > 0.3;
+      const gpx = (i: number): Pt => ({
+        x: hipMid.x + g[i].x * torso,
+        y: hipMid.y + g[i].y * torso,
+      });
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.lineCap = 'round';
+      // ghost 连线（金色）
+      for (const [s, e] of CONNECTIONS) {
+        if (gok(s) && gok(e)) {
+          const sp = gpx(s);
+          const ep = gpx(e);
+          ctx.strokeStyle = GOLD;
+          ctx.lineWidth = 3;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(sp.x, sp.y);
+          ctx.lineTo(ep.x, ep.y);
+          ctx.stroke();
+        }
+      }
+      // ghost 关键点（空心金圈）
+      for (const p of g) {
+        if (p.v > 0.3) {
+          ctx.strokeStyle = GOLD;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(p.x * torso + hipMid.x, p.y * torso + hipMid.y, 4, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+  }
 
   // ---------- 太极教学辅助线 ----------
   if (drawGuides) {

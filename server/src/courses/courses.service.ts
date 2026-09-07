@@ -309,6 +309,7 @@ export class CoursesService {
         description: c.description,
         category: c.category,
         coverUrl: c.coverUrl,
+        videoUrl: c.videoPath, // 示范视频，供训练页画中画演示
         keyframeCount: c.models[0]?.keyframeCount ?? 0,
         durationMs: c.models[0]?.durationMs ?? 0,
       })),
@@ -327,6 +328,7 @@ export class CoursesService {
       description: c.description,
       category: c.category,
       coverUrl: c.coverUrl,
+      videoUrl: c.videoPath,
       keyframeCount: c.models[0]?.keyframeCount ?? 0,
       durationMs: c.models[0]?.durationMs ?? 0,
     };

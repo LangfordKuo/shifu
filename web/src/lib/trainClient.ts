@@ -23,6 +23,8 @@ export interface Deviation {
   actual: number;
   delta: number;
   text: string;
+  /** 面向语音播报的口语短句（不带数字） */
+  spoken?: string;
 }
 
 export interface TrainResult {
@@ -39,9 +41,14 @@ export interface TrainResult {
   phase_total?: number;
   cue?: string;
   phase_changed?: boolean;
+  finished?: boolean;
   match_score?: number;
   progress?: number;
   deviations?: Deviation[];
+  /** 当前拍的标准姿态（归一化），用于贴身叠加对比 */
+  ghost?: Array<{ x: number; y: number; v: number }>;
+  /** 姿态达标且无偏差 */
+  all_good?: boolean;
 }
 
 export type WsMessage =

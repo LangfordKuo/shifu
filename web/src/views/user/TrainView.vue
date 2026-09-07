@@ -39,12 +39,17 @@ const ANGLE_LABELS: Array<[string, string]> = [
 // ---------- 状态 ----------
 const route = useRoute();
 const courseId = Number(route.query.course) || null;
-const courseInfo = ref<{ title: string; keyframeCount: number } | null>(null);
+const courseInfo = ref<{ title: string; keyframeCount: number; videoUrl?: string | null } | null>(
+  null,
+);
 
 const phase = ref<'idle' | 'starting' | 'running'>('idle');
 const demoActive = ref(false); // 演示图片结果展示中（隐藏摄像头占位提示）
 const noPerson = ref(false);
 const soundOn = ref(ttsSupported());
+const showGhost = ref(true); // 标准骨架贴身对比
+const showDemoVideo = ref(true); // 教练示范视频小窗
+const ghostPose = ref<Array<{ x: number; y: number; v: number }> | null>(null);
 const wsMsg = ref('');
 const fps = ref(0);
 const latency = ref(0);
@@ -75,6 +80,23 @@ let courseScoreSum = 0;
 let courseScoreN = 0;
 let maxPhase = 0;
 let samples: Array<{ t: number; score: number; match: number; phase: number }> = [];
+
+// ---------- 人性化播报状态 ----------
+const jointLastSpoken = new Map<string, number>(); // 每个关节的纠偏冷却
+let lastAnyAdviceAt = 0; // 全局纠偏冷却
+let lastPraiseAt = 0; // 鼓励冷却
+let noPersonFrames = 0; // 连续未检测到人体的帧数
+let lastAbsentHintAt = 0; // 离场提示冷却
+let praiseIndex = 0;
+
+const PRAISES = ['很好，保持这个姿态', '不错，就是这样', '姿态很标准，继续', '棒，就是这个感觉'];
+
+function resetVoiceState() {
+  jointLastSpoken.clear();
+  lastAnyAdviceAt = 0;
+  lastPraiseAt = 0;
+  noPersonFrames = 0;
+}
 
 let client: TrainClient | null = null;
 let stream: MediaStream | null = null;
@@ -159,6 +181,8 @@ async function startTraining() {
       course.cue = '准备';
       course.progress = 0;
       course.match = 0;
+      resetVoiceState();
+      speakNow('准备好，跟随口令开始练习', soundOn.value);
     }
 
     // 4. 进入推理循环
@@ -259,6 +283,8 @@ async function stopTraining() {
   course.phase = 0;
   course.cue = '';
   course.progress = 0;
+  ghostPose.value = null;
+  resetVoiceState();
   fps.value = 0;
   latency.value = 0;
 }
@@ -320,9 +346,18 @@ async function captureJpeg(): Promise<ArrayBuffer | null> {
 function handleResult(res: TrainResult) {
   if (res.error) {
     noPerson.value = res.error === 'no_person';
+    if (noPerson.value && running) {
+      noPersonFrames += 1;
+      // 离开画面约 1 秒后提示一次，15 秒内不重复唠叨
+      if (noPersonFrames === 10 && Date.now() - lastAbsentHintAt > 15_000) {
+        lastAbsentHintAt = Date.now();
+        speakNow('请回到画面中央，让镜头看到你的全身', soundOn.value);
+      }
+    }
     return;
   }
   noPerson.value = false;
+  noPersonFrames = 0;
   fpsCount += 1;
   inferenceMs.value = res.inference_ms ?? 0;
 
@@ -336,6 +371,8 @@ function handleResult(res: TrainResult) {
       // 无摄像头（演示模式）时把演示图作为画布背景
       drawSkeleton(canvas, res.landmarks, {
         background: stream ? null : demoImg,
+        // 标准骨架贴身对比（仅真实摄像头时叠加）
+        ghost: stream && showGhost.value ? res.ghost ?? null : null,
       });
     }
   }
@@ -352,6 +389,7 @@ function handleResult(res: TrainResult) {
     course.cue = res.cue ?? course.cue;
     course.progress = res.progress ?? course.progress;
     course.match = res.match_score ?? course.match;
+    ghostPose.value = res.ghost ?? ghostPose.value;
     // 仅真实摄像头训练计入会话统计（演示图片不计入）
     if (running) {
       // 综合分 = 动作规范(五要领) 与 关键帧匹配 各半
@@ -367,13 +405,46 @@ function handleResult(res: TrainResult) {
       });
     }
 
-    if (res.phase_changed) {
-      speakNow(res.cue ?? '', soundOn.value);
-    } else if (result.suggestions[0]) {
-      speak(result.suggestions[0], soundOn.value);
-    }
+    humanizedSpeak(res);
   } else if (result.suggestions[0]) {
     speak(result.suggestions[0], soundOn.value);
+  }
+}
+
+/** 人性化语音策略：口令打断播报；纠偏按关节冷却、去数字口语化；达标低频鼓励 */
+function humanizedSpeak(res: TrainResult) {
+  if (!soundOn.value) return;
+  const now = Date.now();
+
+  // 1. 阶段切换：打断当前语音播报新口令；最后一拍说完成语
+  if (res.phase_changed) {
+    if (res.finished) {
+      speakNow('整套动作完成，做得漂亮！', soundOn.value);
+    } else {
+      speakNow(res.cue ?? '', soundOn.value);
+    }
+    return;
+  }
+
+  // 2. 纠偏：挑最严重的、且该关节 12 秒内没提醒过的；全局至少间隔 4 秒
+  const deviation = (res.deviations ?? []).find(
+    (d) => now - (jointLastSpoken.get(d.joint) ?? 0) > 12_000,
+  );
+  if (deviation) {
+    if (now - lastAnyAdviceAt >= 4_000) {
+      speak(deviation.spoken ?? deviation.text, soundOn.value);
+      jointLastSpoken.set(deviation.joint, now);
+      lastAnyAdviceAt = now;
+    }
+    return;
+  }
+
+  // 3. 姿态达标且无偏差：低频随机鼓励
+  if (res.all_good && now - lastPraiseAt > 20_000 && now - lastAnyAdviceAt > 6_000) {
+    speak(PRAISES[praiseIndex % PRAISES.length]!, soundOn.value);
+    praiseIndex += 1;
+    lastPraiseAt = now;
+    lastAnyAdviceAt = now;
   }
 }
 
@@ -511,6 +582,26 @@ async function runDemo() {
               <canvas ref="canvasRef" class="absolute inset-0 h-full w-full"></canvas>
             </div>
 
+            <!-- 教练示范视频小窗（镜像容器外，避免左右翻转） -->
+            <div
+              v-if="showDemoVideo && courseInfo?.videoUrl && phase === 'running'"
+              class="absolute right-2 top-2 z-10 w-24 overflow-hidden rounded-lg border border-white/40 shadow-lg sm:w-36"
+            >
+              <video
+                class="h-auto w-full"
+                :src="courseInfo.videoUrl"
+                autoplay
+                loop
+                muted
+                playsinline
+              ></video>
+              <div
+                class="absolute left-1 top-1 rounded bg-black/60 px-1 text-[10px] text-white"
+              >
+                示范
+              </div>
+            </div>
+
             <div
               v-if="phase === 'idle' && !demoActive"
               class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-white/70"
@@ -540,6 +631,24 @@ async function runDemo() {
           <Button variant="outline" :disabled="phase !== 'idle'" @click="runDemo">
             <ImageIcon />
             演示图片
+          </Button>
+          <Button
+            v-if="courseId"
+            size="sm"
+            :variant="showGhost ? 'secondary' : 'outline'"
+            :title="showGhost ? '关闭标准骨架对比' : '开启标准骨架对比'"
+            @click="showGhost = !showGhost"
+          >
+            骨架对比 {{ showGhost ? '开' : '关' }}
+          </Button>
+          <Button
+            v-if="courseId && courseInfo?.videoUrl"
+            size="sm"
+            :variant="showDemoVideo ? 'secondary' : 'outline'"
+            :title="showDemoVideo ? '关闭示范视频' : '开启示范视频'"
+            @click="showDemoVideo = !showDemoVideo"
+          >
+            示范视频 {{ showDemoVideo ? '开' : '关' }}
           </Button>
         </div>
       </div>

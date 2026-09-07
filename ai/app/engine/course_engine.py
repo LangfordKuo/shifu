@@ -6,23 +6,65 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
-# 纠偏口令表：joint -> (名称, 目标>当前时的动作, 目标<当前时的动作)
-_PHRASES: dict[str, tuple[str, str, str]] = {
-    "left_elbow": ("左肘", "再打开一些", "再收拢一些"),
-    "right_elbow": ("右肘", "再打开一些", "再收拢一些"),
-    "left_shoulder": ("左肩", "再抬高一些", "再放下一些"),
-    "right_shoulder": ("右肩", "再抬高一些", "再放下一些"),
-    "left_hip": ("左胯", "再松沉一些", "再收拢一些"),
-    "right_hip": ("右胯", "再松沉一些", "再收拢一些"),
-    "left_knee": ("左膝", "再伸直一些", "再屈膝一些"),
-    "right_knee": ("右膝", "再伸直一些", "再屈膝一些"),
+# 纠偏口令表：joint -> (名称, 目标>当前时的候选说法, 目标<当前时的候选说法)
+# spoken 字段为面向 TTS 的口语短句（不带数字），text 为面向屏幕的详细描述
+_PHRASES: dict[str, tuple[str, list[str], list[str]]] = {
+    "left_elbow": (
+        "左肘",
+        ["左肘再打开一些", "左肘稍微抬高一点", "注意左肘，向外打开"],
+        ["左肘再收拢一些", "左肘稍微收一点", "注意收一收左肘"],
+    ),
+    "right_elbow": (
+        "右肘",
+        ["右肘再打开一些", "右肘稍微抬高一点", "注意右肘，向外打开"],
+        ["右肘再收拢一些", "右肘稍微收一点", "注意收一收右肘"],
+    ),
+    "left_shoulder": (
+        "左肩",
+        ["左肩再抬起一些", "注意沉左肩，动作放开"],
+        ["左肩放松下沉一些", "左肩别耸太高，放松"],
+    ),
+    "right_shoulder": (
+        "右肩",
+        ["右肩再抬起一些", "注意沉右肩，动作放开"],
+        ["右肩放松下沉一些", "右肩别耸太高，放松"],
+    ),
+    "left_hip": (
+        "左胯",
+        ["左胯再松沉一些", "沉一沉左胯"],
+        ["左胯收回来一些", "注意收左胯"],
+    ),
+    "right_hip": (
+        "右胯",
+        ["右胯再松沉一些", "沉一沉右胯"],
+        ["右胯收回来一些", "注意收右胯"],
+    ),
+    "left_knee": (
+        "左膝",
+        ["左膝再伸直一些", "左腿蹬直一点"],
+        ["左膝再屈一些", "左膝再弯一点，别绷太直"],
+    ),
+    "right_knee": (
+        "右膝",
+        ["右膝再伸直一些", "右腿蹬直一点"],
+        ["右膝再屈一些", "右膝再弯一点，别绷太直"],
+    ),
 }
+
+PRAISE_POOL = [
+    "很好，保持这个姿态",
+    "不错，就是这样",
+    "姿态很标准，继续",
+    "棒，就是这个感觉",
+]
 
 LOOKAHEAD = 6  # 允许向前跳跃匹配的关键帧数
 ENTER_TH = 18.0  # 平均角度差小于该值（度）视为到达
 MATCH_TH = 15.0  # 单关节偏差超过该值（度）才纠偏
+GOOD_MATCH_TH = 80.0  # 视为"做得好"的匹配分阈值
 MAX_DEVIATIONS = 3
 
 
@@ -35,15 +77,15 @@ def _deviations(
     actual: dict[str, float], target: dict[str, float]
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for joint, ta in _PHRASES.items():
+    for joint, (name, more_pool, less_pool) in _PHRASES.items():
         t = target.get(joint, -1)
         a = actual.get(joint, -1)
         if t < 0 or a < 0:
             continue
         delta = abs(a - t)
         if delta > MATCH_TH:
-            name, more, less = ta
-            word = more if t > a else less
+            pool = more_pool if t > a else less_pool
+            spoken = random.choice(pool)
             items.append(
                 {
                     "joint": joint,
@@ -51,7 +93,10 @@ def _deviations(
                     "target": round(t),
                     "actual": round(a),
                     "delta": round(delta, 1),
-                    "text": f"{name}{word}（目标约{t:.0f}°，当前{a:.0f}°）",
+                    # 屏幕显示：口语短句 + 目标数据
+                    "text": f"{spoken}（目标约{t:.0f}°，当前{a:.0f}°）",
+                    # 语音播报：口语短句，不带数字
+                    "spoken": spoken,
                 }
             )
     items.sort(key=lambda x: x["delta"], reverse=True)
@@ -83,12 +128,20 @@ class CourseSession:
 
         kf = self.keyframes[self.cursor]
         match_score = round(max(0.0, 100 - dists[self.cursor] * 2.5), 1)
+        deviations = _deviations(angles, kf["angles"])
+        finished = phase_changed and self.cursor == self.total - 1
+
         return {
             "phase": kf["index"],
             "phase_total": self.total,
             "cue": kf["cue"],
             "phase_changed": phase_changed,
+            "finished": finished,
             "match_score": match_score,
             "progress": round((self.cursor + 1) / self.total, 3),
-            "deviations": _deviations(angles, kf["angles"]),
+            "deviations": deviations,
+            # 当前拍的标准姿态（归一化），前端叠加到学员身上做对比
+            "ghost": kf["pose"],
+            # 姿态达标且无明显偏差：供前端做低频鼓励播报
+            "all_good": len(deviations) == 0 and match_score >= GOOD_MATCH_TH,
         }
