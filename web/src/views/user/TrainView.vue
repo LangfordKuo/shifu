@@ -74,6 +74,7 @@ let sessionStart = 0;
 let courseScoreSum = 0;
 let courseScoreN = 0;
 let maxPhase = 0;
+let samples: Array<{ t: number; score: number; match: number; phase: number }> = [];
 
 let client: TrainClient | null = null;
 let stream: MediaStream | null = null;
@@ -169,6 +170,7 @@ async function startTraining() {
     courseScoreSum = 0;
     courseScoreN = 0;
     maxPhase = 0;
+    samples = [];
     void frameLoop();
 
     fpsTimer = window.setInterval(() => {
@@ -191,6 +193,7 @@ async function startTraining() {
 
 async function stopTraining() {
   const hadCourseRun = courseId && courseScoreN > 0;
+  const courseSamples = courseId ? samples.splice(0, samples.length) : [];
   running = false;
   phase.value = 'idle';
   demoActive.value = false;
@@ -207,22 +210,44 @@ async function stopTraining() {
   client = null;
   stopSpeaking();
 
-  // 课程模式：上报训练会话
+  // 课程模式：生成训练报告并上报会话
   if (hadCourseRun) {
     const avg = courseScoreSum / courseScoreN;
-    api
-      .post('/training/sessions', {
-        courseId,
-        score: Number(avg.toFixed(1)),
-        durationMs: Date.now() - sessionStart,
-        report: {
-          phases: maxPhase,
-          phaseTotal: course.phaseTotal,
-          frames: courseScoreN,
-        },
-      })
-      .then(() => toast.info('本次训练已记录'))
-      .catch(() => {});
+    const durationMs = Math.min(Date.now() - sessionStart, 86_400_000);
+    void (async () => {
+      let report: Record<string, unknown> | undefined;
+      try {
+        // AI 服务生成节奏对齐报告（失败则仅记录基础数据）
+        const tokens = loadTokens();
+        const resp = await fetch('/ai/api/report', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(tokens?.accessToken ? { Authorization: `Bearer ${tokens.accessToken}` } : {}),
+          },
+          body: JSON.stringify({
+            course_id: courseId,
+            samples: courseSamples.slice(0, 2000),
+          }),
+        });
+        if (resp.ok) report = await resp.json();
+      } catch {
+        // 报告生成失败不阻塞记录
+      }
+      try {
+        await api.post('/training/sessions', {
+          courseId,
+          score: (report?.overall as number) ?? Number(avg.toFixed(1)),
+          durationMs,
+          report: report ?? { frames: courseScoreN, phases: maxPhase, phaseTotal: course.phaseTotal },
+        });
+        toast.success(
+          report ? `训练完成，得分 ${report.overall}，报告已生成` : '训练已记录',
+        );
+      } catch {
+        toast.error('训练记录保存失败');
+      }
+    })();
   }
 
   const canvas = canvasRef.value;
@@ -333,6 +358,13 @@ function handleResult(res: TrainResult) {
       courseScoreSum += (res.score ?? 0) * 0.5 + (res.match_score ?? 0) * 0.5;
       courseScoreN += 1;
       if (res.phase > maxPhase) maxPhase = res.phase;
+      // 采集逐帧样本用于训练报告
+      samples.push({
+        t: Date.now() - sessionStart,
+        score: res.score ?? 0,
+        match: res.match_score ?? 0,
+        phase: res.phase,
+      });
     }
 
     if (res.phase_changed) {

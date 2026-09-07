@@ -8,8 +8,10 @@ import {
   LogOut,
   ShieldCheck,
   Swords,
+  TrendingUp,
   Users,
   Video,
+  KeyRound,
 } from 'lucide-vue-next';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth';
@@ -40,6 +42,8 @@ const navGroups = computed(() => [
     items: [
       { label: '用户管理', to: '/admin/users', icon: Users, roles: ['ADMIN'] },
       { label: '课程管理', to: '/admin/courses', icon: ShieldCheck, roles: ['ADMIN'] },
+      { label: '数据统计', to: '/admin/stats', icon: TrendingUp, roles: ['ADMIN'] },
+      { label: 'AI 设置', to: '/admin/ai-settings', icon: KeyRound, roles: ['ADMIN'] },
     ] as NavItem[],
   },
 ]);

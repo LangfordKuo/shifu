@@ -94,8 +94,16 @@ model TrainingSession {
   score      Float?
   durationMs Int      @default(0)
   reportJson String?
+  advice     String? // DeepSeek 生成的个性化训练建议（异步生成）
   createdAt  DateTime @default(now())
 
   @@index([userId])
   @@index([courseId])
+}
+
+// 系统键值配置（如 AI 服务密钥）
+model SystemConfig {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
 }

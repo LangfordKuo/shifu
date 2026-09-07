@@ -238,6 +238,64 @@ export class CoursesService {
     };
   }
 
+  /** 管理端：关键帧清单（拍号 / 参考时间 / 口令） */
+  async getKeyframes(id: number) {
+    const parsed = (await this.readActiveModel(id)) as {
+      keyframes: Array<{ index: number; t_ms: number; cue: string }>;
+      duration_ms: number;
+    };
+    return {
+      keyframes: parsed.keyframes.map((k) => ({
+        index: k.index,
+        tMs: k.t_ms,
+        cue: k.cue,
+      })),
+      durationMs: parsed.duration_ms,
+    };
+  }
+
+  /** 管理端：更新关键帧口令（按 index 匹配写回模型文件） */
+  async updateCues(id: number, cues: Array<{ index: number; cue: string }>) {
+    const model = await this.prisma.courseModel.findFirst({
+      where: { courseId: id, isActive: true },
+    });
+    if (!model) throw new NotFoundException('课程模型不存在');
+
+    const parsed = (await this.readActiveModel(id)) as {
+      keyframes: Array<{ index: number; t_ms: number; cue: string }>;
+      [k: string]: unknown;
+    };
+    const cueMap = new Map(cues.map((c) => [c.index, c.cue]));
+    let changed = 0;
+    for (const kf of parsed.keyframes) {
+      const next = cueMap.get(kf.index);
+      if (next !== undefined && next !== kf.cue) {
+        kf.cue = next;
+        changed += 1;
+      }
+    }
+    if (changed > 0) {
+      await fs.promises.writeFile(
+        model.modelPath,
+        JSON.stringify(parsed, null, 2),
+        'utf-8',
+      );
+    }
+    return { updated: changed };
+  }
+
+  private async readActiveModel(courseId: number) {
+    const model = await this.prisma.courseModel.findFirst({
+      where: { courseId, isActive: true },
+    });
+    if (!model) throw new NotFoundException('课程模型不存在');
+    try {
+      return JSON.parse(await fs.promises.readFile(model.modelPath, 'utf-8'));
+    } catch {
+      throw new NotFoundException('课程模型文件缺失，请重新提取');
+    }
+  }
+
   async findAllPublished() {
     const courses = await this.prisma.course.findMany({
       where: { status: COURSE_STATUS.PUBLISHED },

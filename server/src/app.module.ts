@@ -7,6 +7,8 @@ import { UsersModule } from './users/users.module';
 import { CoursesModule } from './courses/courses.module';
 import { InternalModule } from './internal/internal.module';
 import { TrainingModule } from './training/training.module';
+import { StatsModule } from './stats/stats.module';
+import { AiConfigModule } from './aiconfig/aiconfig.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 
@@ -19,6 +21,8 @@ import { RolesGuard } from './common/guards/roles.guard';
     CoursesModule,
     InternalModule,
     TrainingModule,
+    StatsModule,
+    AiConfigModule,
   ],
   providers: [
     // 全局守卫：先鉴权（可用 @Public() 跳过），再校验角色（可用 @Roles() 声明）

@@ -90,6 +90,18 @@
 YOLO pose 为 COCO 17 点（无手指/脚趾细节）。引擎层抽象了关键点接口，
 后期可引入 RTMPose(133点) / MediaPipe 补充细节，评分器按所需关节集合声明依赖。
 
+### 2.5 AI 训练建议（DeepSeek，可配置）
+
+- 配置存储：`SystemConfig` 表（ai.baseUrl / ai.model / ai.apiKey / ai.enabled），
+  管理端「AI 设置」页填写；密钥不回传浏览器（仅回显是否已配置）
+- 默认接口 `https://api.deepseek.com`，模型 `deepseek-v4-flash`（OpenAI 兼容
+  `/chat/completions`；接口地址与模型均可改，便于替换其他兼容服务）
+- 流程：会话上报（POST /api/training/sessions）→ Node 后台异步将报告摘要
+  （课程/综合/规范/匹配/节奏/分拍明细）发给 LLM → 建议写回 `TrainingSession.advice`
+- 失败静默降级：未配置密钥、停用开关或调用失败均不影响训练记录本身；
+  历史报告弹窗中未就绪时提供「刷新」
+- `POST /admin/ai-config/test` 供管理端一键测试连接
+
 ## 3. 数据模型（server/prisma/schema.prisma）
 
 - `User`（role: ADMIN/USER，status: ACTIVE/DISABLED）
@@ -97,7 +109,8 @@ YOLO pose 为 COCO 17 点（无手指/脚趾细节）。引擎层抽象了关键
 - `Course`（status: DRAFT/TRAINING/PUBLISHED/OFFLINE）
 - `CourseModel`（课程模型版本，modelPath 指向 JSON 文件）
 - `TrainingJob`（AI 任务进度，Node 下发、Python 回写，管理端轮询/SSE 展示）
-- `TrainingSession`（训练会话：score / durationMs / reportJson）
+- `TrainingSession`（训练会话：score / durationMs / reportJson / advice）
+- `SystemConfig`（键值配置：AI 接口地址 / 模型 / 密钥 / 启用开关）
 
 SQLite 不支持 enum，全部用字符串常量（`src/common/constants.ts` 为唯一出处），
 切 MySQL 时可平滑升级为 enum。

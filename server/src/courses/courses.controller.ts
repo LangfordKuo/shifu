@@ -7,6 +7,7 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Put,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -15,11 +16,37 @@ import { diskStorage } from 'multer';
 import { extname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
+import { Type } from 'class-transformer';
+import {
+  IsArray,
+  IsInt,
+  IsString,
+  MaxLength,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 import { CoursesService } from './courses.service';
 import { Roles } from '../common/decorators/roles.decorator';
 import { Req } from '@nestjs/common';
 import { ROLE } from '../common/constants';
 import { CreateCourseDto, UpdateCourseDto } from './dto/courses.dto';
+
+class CueItemDto {
+  @IsInt()
+  @Min(1)
+  index!: number;
+
+  @IsString()
+  @MaxLength(60)
+  cue!: string;
+}
+
+class UpdateCuesDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CueItemDto)
+  cues!: CueItemDto[];
+}
 
 const VIDEO_RE = /\.(mp4|mov|avi|mkv|webm)$/i;
 
@@ -62,6 +89,20 @@ export class AdminCoursesController {
   @Get(':id')
   findOneAdmin(@Param('id', ParseIntPipe) id: number) {
     return this.coursesService.findOneAdmin(id);
+  }
+
+  /** 关键帧清单（供口令编辑） */
+  @Get(':id/keyframes')
+  getKeyframes(@Param('id', ParseIntPipe) id: number) {
+    return this.coursesService.getKeyframes(id);
+  }
+
+  @Put(':id/keyframes/cues')
+  updateCues(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateCuesDto,
+  ) {
+    return this.coursesService.updateCues(id, dto.cues);
   }
 
   /** 创建课程：上传示范视频并自动触发关键帧提取 */

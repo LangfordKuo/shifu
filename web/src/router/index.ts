@@ -22,6 +22,8 @@ const router = createRouter({
         // ---- 管理端 ----
         { path: 'admin/users', name: 'admin-users', component: () => import('@/views/admin/UsersView.vue'), meta: { roles: ['ADMIN'] } },
         { path: 'admin/courses', name: 'admin-courses', component: () => import('@/views/admin/AdminCoursesView.vue'), meta: { roles: ['ADMIN'] } },
+        { path: 'admin/stats', name: 'admin-stats', component: () => import('@/views/admin/StatsView.vue'), meta: { roles: ['ADMIN'] } },
+        { path: 'admin/ai-settings', name: 'admin-ai-settings', component: () => import('@/views/admin/AiSettingsView.vue'), meta: { roles: ['ADMIN'] } },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/' },

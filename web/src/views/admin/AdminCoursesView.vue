@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import {
   CloudUpload,
   Film,
+  ListOrdered,
   Loader2,
   Plus,
   Rocket,
@@ -196,6 +197,52 @@ function fmtDuration(ms: number) {
   return `${Math.floor(s / 60)}分${s % 60}秒`;
 }
 
+// ---------- 关键帧口令编辑 ----------
+interface KeyframeRow {
+  index: number;
+  tMs: number;
+  cue: string;
+}
+const kfDialog = ref(false);
+const kfCourse = ref<CourseRow | null>(null);
+const kfRows = ref<KeyframeRow[]>([]);
+const kfLoading = ref(false);
+const kfSaving = ref(false);
+
+async function openKeyframes(row: CourseRow) {
+  kfCourse.value = row;
+  kfDialog.value = true;
+  kfLoading.value = true;
+  try {
+    const data = await api.get<{ keyframes: KeyframeRow[] }>(
+      `/admin/courses/${row.id}/keyframes`,
+    );
+    kfRows.value = data.keyframes;
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '加载关键帧失败');
+    kfDialog.value = false;
+  } finally {
+    kfLoading.value = false;
+  }
+}
+
+async function saveCues() {
+  if (!kfCourse.value) return;
+  kfSaving.value = true;
+  try {
+    const res = await api.put<{ updated: number }>(
+      `/admin/courses/${kfCourse.value.id}/keyframes/cues`,
+      { cues: kfRows.value.map((k) => ({ index: k.index, cue: k.cue })) },
+    );
+    toast.success(`已更新 ${res.updated} 条口令`);
+    kfDialog.value = false;
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '保存失败');
+  } finally {
+    kfSaving.value = false;
+  }
+}
+
 function fmtTime(s: string) {
   return new Date(s).toLocaleString('zh-CN', { hour12: false });
 }
@@ -278,6 +325,15 @@ const statusBadge = (s: string) =>
               </TableCell>
               <TableCell class="text-muted-foreground">{{ fmtTime(row.createdAt) }}</TableCell>
               <TableCell class="space-x-1 text-right">
+                <Button
+                  v-if="row.keyframeCount"
+                  size="sm"
+                  variant="ghost"
+                  title="编辑关键帧口令"
+                  @click="openKeyframes(row)"
+                >
+                  <ListOrdered />
+                </Button>
                 <Button
                   v-if="row.status === 'DRAFT' && row.keyframeCount"
                   size="sm"
@@ -377,6 +433,37 @@ const statusBadge = (s: string) =>
             </Button>
           </DialogFooter>
         </form>
+      </DialogContent>
+    </Dialog>
+
+    <!-- 关键帧口令编辑 -->
+    <Dialog v-model:open="kfDialog">
+      <DialogContent class="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>关键帧口令 · {{ kfCourse?.title }}</DialogTitle>
+          <DialogDescription>
+            训练到对应拍时 TTS 将播报口令，建议写成动作要领（如"起势，两臂慢慢前举"）
+          </DialogDescription>
+        </DialogHeader>
+        <div v-if="kfLoading" class="py-8 text-center text-sm text-muted-foreground">加载中…</div>
+        <div v-else class="max-h-80 space-y-2 overflow-y-auto pr-1">
+          <div v-for="k in kfRows" :key="k.index" class="flex items-center gap-3">
+            <span class="w-16 shrink-0 text-sm text-muted-foreground">
+              第 {{ k.index }} 拍
+            </span>
+            <span class="w-16 shrink-0 text-xs text-muted-foreground">
+              {{ Math.round(k.tMs / 1000) }}s
+            </span>
+            <Input v-model="k.cue" :placeholder="`第 ${k.index} 拍的动作要领`" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" :disabled="kfSaving" @click="kfDialog = false">取消</Button>
+          <Button :disabled="kfSaving || kfLoading" @click="saveCues">
+            <Loader2 v-if="kfSaving" class="animate-spin" />
+            保存口令
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
 
