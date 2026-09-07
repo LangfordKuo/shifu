@@ -6,10 +6,14 @@ import {
   ListOrdered,
   Loader2,
   MapPinPlus,
+  Pause,
+  Play,
   Plus,
   Rocket,
   Trash2,
   Undo2,
+  Volume2,
+  VolumeX,
   Wand2,
 } from 'lucide-vue-next';
 import { toast } from 'vue-sonner';
@@ -205,6 +209,75 @@ const markVideoRef = ref<HTMLVideoElement | null>(null);
 const currentTime = ref(0);
 const savingMarkers = ref(false);
 const generating = ref(false);
+
+// 自绘进度条 / 播放控制
+const trackRef = ref<HTMLDivElement | null>(null);
+const isPlaying = ref(false);
+const isMuted = ref(false);
+const durMs = ref(0);
+const dragIndex = ref(-1);
+
+const progressPct = computed(() =>
+  durMs.value > 0 ? Math.min(100, (currentTime.value * 1000) / durMs.value * 100) : 0,
+);
+
+function markerPct(m: MarkerRow) {
+  return durMs.value > 0 ? Math.min(100, (m.tMs / durMs.value) * 100) : 0;
+}
+
+function onVideoMeta(e: Event) {
+  durMs.value = Math.round((e.target as HTMLVideoElement).duration * 1000) || 0;
+}
+
+function togglePlay() {
+  const v = markVideoRef.value;
+  if (!v) return;
+  if (v.paused) void v.play();
+  else v.pause();
+}
+
+function toggleMute() {
+  const v = markVideoRef.value;
+  if (!v) return;
+  v.muted = !v.muted;
+  isMuted.value = v.muted;
+}
+
+function onTrackSeek(e: PointerEvent) {
+  const track = trackRef.value;
+  const v = markVideoRef.value;
+  if (!track || !v || !durMs.value) return;
+  const rect = track.getBoundingClientRect();
+  const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+  v.currentTime = (ratio * durMs.value) / 1000;
+}
+
+/** 拖动打点圆点微调时间，松手后与相邻打点保持至少 0.2s 间隔 */
+function startDrag(i: number, e: PointerEvent) {
+  e.preventDefault();
+  dragIndex.value = i;
+  const track = trackRef.value;
+  if (!track) return;
+  const rect = track.getBoundingClientRect();
+
+  const move = (ev: PointerEvent) => {
+    const ratio = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+    markers.value[i]!.tMs = Math.round(ratio * durMs.value);
+    currentTime.value = markers.value[i]!.tMs / 1000;
+  };
+  const up = () => {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    // 与相邻打点保持最小间隔
+    const MIN_GAP = 200;
+    const prev = markers.value[i - 1]?.tMs ?? -Infinity;
+    const next = markers.value[i + 1]?.tMs ?? Infinity;
+    markers.value[i]!.tMs = Math.min(Math.max(markers.value[i]!.tMs, prev + MIN_GAP), next - MIN_GAP);
+    dragIndex.value = -1;
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
 
 async function openMarking(row: CourseRow) {
   markCourse.value = row;
@@ -589,17 +662,70 @@ const statusBadge = (s: string, keyframes = 1) =>
             播放视频，在每个动作拍的位置「打点」（或按空格键），为每拍填写口令后生成动作模型
           </DialogDescription>
         </DialogHeader>
-        <div class="space-y-3">
+        <div class="space-y-2">
           <div class="overflow-hidden rounded-lg border bg-black">
             <video
               ref="markVideoRef"
               :src="markCourse?.videoPath ?? undefined"
-              controls
-              class="max-h-[44vh] w-full"
+              class="max-h-[40vh] w-full cursor-pointer"
+              playsinline
+              @click="togglePlay"
               @timeupdate="currentTime = ($event.target as HTMLVideoElement).currentTime"
+              @loadedmetadata="onVideoMeta"
+              @play="isPlaying = true"
+              @pause="isPlaying = false"
+              @ended="isPlaying = false"
             ></video>
           </div>
-          <div class="flex flex-wrap items-center gap-2">
+
+          <!-- 自绘进度条：打标圆点标注，可点击跳转、拖动圆点微调 -->
+          <div
+            ref="trackRef"
+            class="relative h-3 cursor-pointer select-none rounded-full bg-muted"
+            @pointerdown="onTrackSeek"
+          >
+            <div
+              class="absolute inset-y-0 left-0 rounded-full bg-primary/60"
+              :style="{ width: progressPct + '%' }"
+            ></div>
+            <div
+              v-for="(m, i) in markers"
+              :key="'mk' + m.tMs"
+              class="group absolute top-1/2 z-10 -translate-x-1/2 -translate-y-1/2"
+              :style="{ left: markerPct(m) + '%' }"
+              :title="`第${i + 1}拍 ${fmtMs(m.tMs)}（拖动调整）`"
+              @pointerdown.stop="startDrag(i, $event)"
+            >
+              <div
+                class="size-3.5 rounded-full border-2 border-white bg-amber-400 shadow-md transition-transform group-hover:scale-125"
+                :class="dragIndex === i ? 'scale-125 cursor-grabbing ring-2 ring-amber-300' : 'cursor-grab'"
+              ></div>
+            </div>
+            <div
+              class="pointer-events-none absolute top-1/2 z-20 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow"
+              :style="{ left: progressPct + '%' }"
+            ></div>
+          </div>
+
+          <!-- 播放控制 -->
+          <div class="flex items-center gap-2">
+            <Button size="icon" variant="ghost" class="size-8" @click="togglePlay">
+              <Pause v-if="isPlaying" class="size-4" />
+              <Play v-else class="size-4" />
+            </Button>
+            <span class="font-mono text-xs text-muted-foreground">
+              {{ fmtMs(Math.round(currentTime * 1000)) }} / {{ fmtMs(durMs) }}
+            </span>
+            <Button size="icon" variant="ghost" class="size-8" @click="toggleMute">
+              <Volume2 v-if="!isMuted" class="size-4" />
+              <VolumeX v-else class="size-4" />
+            </Button>
+            <span class="ml-auto text-xs text-muted-foreground">
+              点击进度条跳转 · 拖动金色圆点微调打点位置
+            </span>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
             <Button size="sm" @click="addMarker">
               <MapPinPlus />
               在当前位置打点（{{ fmtMs(Math.round(currentTime * 1000)) }}）
@@ -647,7 +773,6 @@ const statusBadge = (s: string, keyframes = 1) =>
               </Button>
             </div>
           </div>
-        </div>
       </DialogContent>
     </Dialog>
 
