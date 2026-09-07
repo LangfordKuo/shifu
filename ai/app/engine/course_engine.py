@@ -140,8 +140,11 @@ class CourseSession:
             "match_score": match_score,
             "progress": round((self.cursor + 1) / self.total, 3),
             "deviations": deviations,
-            # 当前拍的标准姿态（归一化），前端叠加到学员身上做对比
-            "ghost": kf["pose"],
+            # 当前拍的标准姿态（归一化），转为 {"x","y","v"} 结构供前端叠加
+            "ghost": [
+                {"x": p[0], "y": p[1], "v": p[2]} if isinstance(p, (list, tuple)) else p
+                for p in kf["pose"]
+            ],
             # 姿态达标且无明显偏差：供前端做低频鼓励播报
             "all_good": len(deviations) == 0 and match_score >= GOOD_MATCH_TH,
         }

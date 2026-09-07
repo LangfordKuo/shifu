@@ -62,18 +62,28 @@ export function drawSkeleton(
   const px = (i: number): Pt => ({ x: landmarks[i].x * w, y: landmarks[i].y * h });
   const drawGuides = opts.drawGuides !== false;
 
-  // ---------- 标准姿态叠加（ghost）：适配到用户当前身体位置 ----------
-  if (opts.ghost && ok(5) && ok(6) && ok(11) && ok(12)) {
-    const kp = [px(5), px(6), px(11), px(12)];
-    const hipMid = { x: (kp[2].x + kp[3].x) / 2, y: (kp[2].y + kp[3].y) / 2 };
-    const shMid = { x: (kp[0].x + kp[1].x) / 2, y: (kp[0].y + kp[1].y) / 2 };
-    const torso = Math.hypot(shMid.x - hipMid.x, shMid.y - hipMid.y);
-    if (torso > 8) {
-      const g = opts.ghost;
-      const gok = (i: number) => g[i] && g[i].v > 0.3;
+  // ---------- 标准姿态叠加（ghost）：锚定用户双肩适配缩放 ----------
+  // 以肩中点为锚（而非髋部），半身入画时也能显示；兼容数组与对象两种点格式
+  if (opts.ghost && ok(5) && ok(6)) {
+    const g: Landmark[] = opts.ghost.map((p) =>
+      Array.isArray(p)
+        ? { x: p[0] as number, y: p[1] as number, v: p[2] as number }
+        : (p as Landmark),
+    );
+    const shUser = px(5);
+    const shUser2 = px(6);
+    const anchor = { x: (shUser.x + shUser2.x) / 2, y: (shUser.y + shUser2.y) / 2 };
+    const userShoulderW = Math.hypot(shUser.x - shUser2.x, shUser.y - shUser2.y);
+    const gok = (i: number) => g[i] && g[i].v > 0.3;
+    const gSh = g[5];
+    const gSh2 = g[6];
+    if (userShoulderW > 8 && gSh && gSh2 && gSh.v > 0.3 && gSh2.v > 0.3) {
+      const gShMid = { x: (gSh.x + gSh2.x) / 2, y: (gSh.y + gSh2.y) / 2 };
+      const gShoulderW = Math.hypot(gSh.x - gSh2.x, gSh.y - gSh2.y);
+      const scale = userShoulderW / Math.max(gShoulderW, 1e-6);
       const gpx = (i: number): Pt => ({
-        x: hipMid.x + g[i].x * torso,
-        y: hipMid.y + g[i].y * torso,
+        x: anchor.x + (g[i].x - gShMid.x) * scale,
+        y: anchor.y + (g[i].y - gShMid.y) * scale,
       });
       ctx.save();
       ctx.globalAlpha = 0.55;
@@ -98,7 +108,13 @@ export function drawSkeleton(
           ctx.strokeStyle = GOLD;
           ctx.lineWidth = 1.5;
           ctx.beginPath();
-          ctx.arc(p.x * torso + hipMid.x, p.y * torso + hipMid.y, 4, 0, Math.PI * 2);
+          ctx.arc(
+            anchor.x + (p.x - gShMid.x) * scale,
+            anchor.y + (p.y - gShMid.y) * scale,
+            4,
+            0,
+            Math.PI * 2,
+          );
           ctx.stroke();
         }
       }
